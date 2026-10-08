@@ -66,3 +66,13 @@ All API requests require the session token injected into the local HTML page.
 7. Evaluate local AI on labelled real failures; require evidence references, measure misleading hypotheses, and keep execution independent of model output.
 
 Flashing, manufacturing screening, Android/ADB, performance qualification and certification testing are outside the current version. No claims of universal Ubuntu/Yocto or arbitrary proprietary-board support are made.
+
+## Connection milestone (0.2)
+
+`credentials.py` owns a locked per-process secret map, session presence metadata and evidence/error redaction. Password fields are Pydantic SecretStr inputs excluded from serialised board records. The validation-error handler omits original input values. Lifespan clears credentials on startup/shutdown.
+
+`uart.py` adds bounded Linux login and identity verification through pyserial. A per-port lock and Linux exclusive serial opening protect concurrent UART verification. A nonce-delimited command response separates shell echo from script output. Its identity script is the same fixed Linux inspection used by SSH, executed through a quoted POSIX printf pipeline. UART test runs are explicitly blocked pending a dedicated run/session implementation.
+
+New API behavior: POST `/api/boards/{id}/connection` edits settings while idle; POST `/api/boards/{id}/forget-passwords` clears memory-only secrets while idle; GET `/api/serial-ports` lists local devices; POST `/api/boards/{id}/verify` accepts an optional transport of ssh, uart or simulator and saves separate last-check states. Password values are not present in responses or persisted metadata. Known host verification still applies to password-based SSH.
+
+Continuous UART streaming, serial command/log ownership during test runs, hardware identity, trusted SSH reconnection after IP changes, and credential-manager storage remain next milestones.
