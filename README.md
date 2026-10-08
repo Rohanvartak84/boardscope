@@ -1,4 +1,4 @@
-# BoardScope 0.1 — local engineering preview
+# BoardScope 0.2 — local engineering preview
 
 A runnable first version of the embedded Linux test workbench. The browser dashboard talks to a local Python service. The service runs a simulator or SSH commands on a configured board and saves results on the lab PC. No Docker, board-side package, cloud account or frontend build is required.
 
@@ -27,10 +27,10 @@ The downloadable source excludes the development environment and test data. Inst
 
 ## Connect your physical Ubuntu / Yocto board
 
-BoardScope requires a Linux boot ID at `/proc/sys/kernel/random/boot_id`, `/sys` mounted, `sh`, `uname`, and an SSH server with key/agent authentication. RISC-V is not an installation dependency: commands execute remotely, and reported architecture comes from `uname -m`. Actual compatibility depends on your board image and SSH configuration.
+BoardScope requires a Linux boot ID at `/proc/sys/kernel/random/boot_id`, `/sys` mounted, `sh`, `uname`, and an SSH server with password or key/agent authentication. RISC-V is not an installation dependency: commands execute remotely, and reported architecture comes from `uname -m`. Actual compatibility depends on your board image and SSH configuration.
 
 1. From the same lab PC, establish SSH to your board and verify the host fingerprint through your normal trusted process. BoardScope uses system known_hosts and rejects unknown or changed host keys. It does not silently accept fingerprints.
-2. Register the name, OS label, SSH hostname/IP, username and port. Supply a private key path on the PC, or use your SSH agent/default key. Private key contents are not stored in the database. Encrypted keys require an already loaded SSH agent.
+2. Register the name, OS label, SSH hostname/IP, username and port. Choose Password and enter the board password, or choose SSH key / agent and supply a private key path on the PC or use your SSH agent/default key. Private key contents are not stored in the database. Encrypted keys require an already loaded SSH agent.
 3. Set the expected interface to your board's name, such as `eth0` or `end0`; leave it blank to skip this assertion. Optional expected sound-card count must match your hardware. An interface inventory check is not a connectivity test.
 4. Verify the connection, then run Linux inventory first.
 5. For reboot testing, the account must already have permission for non-interactive `sudo -n /sbin/reboot`. This first version does not modify sudoers and does not support root-only reboot commands or a custom reset command. Confirm authorisation in the run form.
@@ -78,3 +78,17 @@ See `ARCHITECTURE.md` for components and the next implementation milestones. Thi
 ## Shared development
 
 See `CONTRIBUTING.md` for the GitHub workflow and next SSH-password/UART milestones. `AGENTS.md` provides contributor guidance. `.github/workflows/tests.yml` runs backend tests on pushes and pull requests; it has not yet run on GitHub. Code lives in GitHub while the tool and hardware testing remain local.
+
+## Connection page (0.2)
+
+Open **Boards → Connect / settings** on an existing physical board, or register a new board. You can now edit its IP and connection settings without registering another board.
+
+For SSH, select **Password** or **SSH key / agent**. Enter the board username and the matching password/key details, save, and then Verify SSH. Password mode does not try unrelated agent/default keys. Passwords remain in server memory only, disappear after restart, and are never returned by API responses or persisted in board/run snapshots. Blank password fields keep the current session value; use **Forget passwords** to remove both session passwords. The UI clears password inputs when a dialog closes. There is no Remember credentials option yet.
+
+For UART, connect a USB UART adapter matching the board's voltage and leave adapter VCC disconnected when the board is independently powered. Configure the serial device path (for example `/dev/ttyUSB0` or a stable `/dev/serial/by-id/...` path), baud rate, and Linux console username/password if required. Available serial devices are listed in the dialog; manual paths are supported. Close other terminal applications and ensure your host user has access to the device. Save, reopen Connect, and choose **Check saved UART**.
+
+The UART verifier listens for a plain Linux `login:` / `Password:` prompt or an automatic shell ending in `$` or `#`, authenticates if necessary, and executes the fixed read-only Linux identity script. A detected bootloader prompt is rejected without sending credentials. Sending Enter to wake an idle console is disabled by default; explicitly enable it only when the board is already at a Linux login or shell. Unrecognised prompts, coloured/custom shells, two-factor logins and bootloader consoles may require additional board-specific support. Verification closes the port afterward. Linux hosts are the initial UART target.
+
+SSH and UART each show their last verification result, timestamp and error. These are point-in-time checks, not continuous connectivity indicators. Matching boot UUIDs indicate the two checks reached the same running kernel; a mismatch can mean a different board or a reboot between checks and requires investigation. Capability snapshots do not provide permanent hardware identity.
+
+UART-only boards can be registered and verified. **UART reboot/test execution, live console streaming and automatic SSH fallback are not part of this milestone.** SSH test execution and optional read-only serial capture remain as before. Password login does not grant reboot privileges; SSH reboot still requires noninteractive `sudo -n /sbin/reboot` permission.

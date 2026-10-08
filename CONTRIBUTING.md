@@ -20,10 +20,10 @@ Do not pull source changes into a running physical test. An interrupted run will
 
 ## Next feature work
 
-- SSH password login with session-only credentials, excluded from persistence and reports.
-- UART login and shell-command execution with configurable prompt detection and automatic-shell support.
+- SSH password login and session-only credentials are implemented in 0.2.
+- UART login and fixed read-only identity verification are implemented in 0.2; broader prompt support and test execution remain next.
 - Serial ownership shared correctly between command execution and log capture.
 - Reboot observation, console re-login and changed boot-ID verification through UART.
 - Optional credential persistence through an OS credential manager.
 
-Those features are planned, not present in this repository's first version. Implement them in small reviewed changes with prompt, timeout, redaction and reconnect tests before trying real hardware.
+The remaining items are planned; implemented connection features are documented in README.md. Implement them in small reviewed changes with prompt, timeout, redaction and reconnect tests before trying real hardware.

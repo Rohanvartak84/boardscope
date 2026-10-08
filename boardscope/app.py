@@ -17,7 +17,9 @@ from urllib.request import Request as URLRequest, urlopen
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
+from fastapi.exceptions import RequestValidationError
+from .credentials import set_credentials, credential_status, clear_credentials, redact
 
 from .adapters import adapter
 
@@ -99,16 +101,21 @@ def patch_run(run_id, fields, states=None):
 
 def event(run_id, message, level='info'):
     with connection() as c:
-        c.execute('INSERT INTO events(run_id,data) VALUES(?,?)', (run_id, json.dumps({'time': now(), 'message': str(message)[:4000], 'level': level})))
+        c.execute('INSERT INTO events(run_id,data) VALUES(?,?)', (run_id, json.dumps({'time': now(), 'message': redact(str(message))[:4000], 'level': level})))
 
 
 class BoardInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    mode: Literal['simulator','ssh'] = 'simulator'
+    mode: Literal['simulator','ssh','uart'] = 'simulator'
     environment: Literal['Ubuntu','Yocto'] = 'Ubuntu'
     host: str = Field(default='', max_length=253)
     port: int = Field(default=22, ge=1, le=65535)
     username: str = Field(default='', max_length=64)
+    auth_method: Literal['key','password'] = 'key'
+    ssh_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
+    uart_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
+    uart_username: str = Field(default='', max_length=64)
+    uart_wake: bool = False
     key_path: str = Field(default='', max_length=512)
     serial_port: str = Field(default='', max_length=256)
     baud: int = Field(default=115200, ge=1200, le=4000000)
@@ -117,7 +124,7 @@ class BoardInput(BaseModel):
     scenario: Literal['none','missing_device','boot_timeout'] = 'none'
     failure_cycle: int = Field(default=3, ge=1, le=1000)
 
-    @field_validator('host','username','network_interface')
+    @field_validator('host','username','uart_username','network_interface')
     @classmethod
     def safe_name(cls, v):
         if v and any(ch not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-%@' for ch in v):
@@ -249,7 +256,7 @@ def run_worker(run_id):
                 cycle_out='cancelled';logs=str(exc)
             except Exception as exc:
                 cycle_out='error';logs=str(exc)+'\n'+a.evidence()
-            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'snapshot':snapshot,'kernel_log':logs[:262144],'serial_log':''.join(serial_text[offset:])[:262144],'simulated':a.simulated}
+            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(''.join(serial_text[offset:]))[:262144],'simulated':a.simulated}
             with connection() as c:c.execute('INSERT INTO cycles VALUES(?,?,?,?)',(cycle['id'],run_id,n,json.dumps(cycle)))
             event(run_id,f'Cycle {n}: {cycle_out}', 'error' if cycle_out in ('fail','error') else 'info')
             patch_run(run_id, {'completed_cycles':n})
@@ -267,7 +274,7 @@ def run_worker(run_id):
                 time.sleep(.05)
     except Exception as exc:
         event(run_id, 'Execution error: '+str(exc),'error')
-        patch_run(run_id, {'message':str(exc),'outcome':'error'})
+        patch_run(run_id, {'message':redact(str(exc)),'outcome':'error'})
     finally:
         capture_stop.set()
         if capture_thread:capture_thread.join(timeout=1)
@@ -290,9 +297,9 @@ def run_worker(run_id):
 
 @asynccontextmanager
 async def lifespan(app):
-    STOP.clear();init_db()
+    STOP.clear();clear_credentials();init_db()
     yield
-    STOP.set()
+    STOP.set();clear_credentials()
 
 
 app=FastAPI(title='BoardScope',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
@@ -318,6 +325,12 @@ async def local_access(req:Request, call_next):
 @app.get('/',response_class=HTMLResponse)
 def home():return (STATIC/'index.html').read_text().replace('__TOKEN__',TOKEN)
 
+@app.exception_handler(RequestValidationError)
+async def validation_error(req, exc):
+    # Pydantic errors can contain the original password input. Do not echo it.
+    return JSONResponse({'detail':[{'loc':list(e['loc']),'msg':e['msg'],'type':e['type']} for e in exc.errors()]},status_code=422)
+
+
 app.mount('/static',StaticFiles(directory=STATIC),name='static')
 
 
@@ -327,33 +340,91 @@ def state():
     for r in runs:
         if r.get('script_snapshot'):
             r['script_snapshot']={k:v for k,v in r['script_snapshot'].items() if k!='source'}
-    return {'boards':all_items('boards'),'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.1.0','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
+    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.2.0','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
 
 
-@app.post('/api/boards',status_code=201)
-def create_board(body:BoardInput):
+def save_board(body, bid=None):
     b=body.model_dump()
     if b['mode']=='ssh' and (not b['host'] or not b['username']):raise HTTPException(422,'SSH host and username required')
+    if b['mode']=='uart' and not b['serial_port']:raise HTTPException(422,'UART mode requires a serial port')
+    if body.uart_password and any(c in body.uart_password.get_secret_value() for c in ('\n','\r')):
+        raise HTTPException(422,'UART passwords cannot contain newline characters')
     if b['key_path']:
         path=Path(b['key_path']).expanduser()
         if not path.is_file():raise HTTPException(422,'SSH key path must refer to a file on this host')
         b['key_path']=str(path)
-    b.update(id=str(uuid.uuid4()),created_at=now())
-    with connection() as c:c.execute('INSERT INTO boards VALUES(?,?)',(b['id'],json.dumps(b)))
-    return b
+    b.update(id=bid or str(uuid.uuid4()),created_at=now())
+    with connection() as c:
+        if bid:
+            old=item('boards',bid);b['created_at']=old['created_at']
+            c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
+        else:c.execute('INSERT INTO boards VALUES(?,?)',(b['id'],json.dumps(b)))
+    set_credentials(b['id'],ssh_password=body.ssh_password.get_secret_value() if body.ssh_password is not None else None,uart_password=body.uart_password.get_secret_value() if body.uart_password is not None else None)
+    return dict(b,credential_status=credential_status(b['id']))
+
+
+def require_idle(bid):
+    with connection() as c:
+        if c.execute("SELECT 1 FROM runs WHERE board_id=? AND state IN ('queued','running','paused','pausing','stopping')",(bid,)).fetchone():raise HTTPException(409,'Board reserved by an active run')
+
+
+@app.post('/api/boards',status_code=201)
+def create_board(body:BoardInput):
+    with BOARD_GATE:return save_board(body)
+
+
+@app.post('/api/boards/{bid}/connection')
+def update_board_connection(bid:str,body:BoardInput):
+    with BOARD_GATE:
+        item('boards',bid);require_idle(bid)
+        return save_board(body,bid)
+
+
+@app.post('/api/boards/{bid}/forget-passwords')
+def forget_passwords(bid:str):
+    with BOARD_GATE:
+        item('boards',bid);require_idle(bid)
+        set_credentials(bid,ssh_password='',uart_password='')
+        return {'credential_status':credential_status(bid)}
+
+
+class VerificationInput(BaseModel):
+    transport: Literal['ssh','uart','simulator'] | None = None
+
+
+@app.get('/api/serial-ports')
+def serial_ports():
+    from serial.tools import list_ports
+    return [{'path':p.device,'description':p.description} for p in list_ports.comports()]
 
 
 @app.post('/api/boards/{bid}/verify')
-def verify(bid:str):
+def verify(bid:str,body:VerificationInput | None=None):
     with BOARD_GATE:
-        with connection() as c:
-            if c.execute("SELECT 1 FROM runs WHERE board_id=? AND state IN ('queued','running','paused','pausing','stopping')",(bid,)).fetchone():raise HTTPException(409,'Board reserved by an active run')
-        b=item('boards',bid)
-        try:result=adapter(b).inspect()
-        except Exception as exc:raise HTTPException(400,str(exc))
+        require_idle(bid);b=item('boards',bid)
+        transport=body.transport if body and body.transport else b['mode']
+        if b['mode']=='simulator' and transport!='simulator':raise HTTPException(422,'Simulator cannot verify physical connections')
+        if b['mode']!='simulator' and transport=='simulator':raise HTTPException(422,'Physical boards cannot be verified through the simulator')
+        if transport=='ssh' and (not b.get('host') or not b.get('username')):raise HTTPException(422,'Configure SSH host and username first')
+        if transport=='uart' and not b.get('serial_port'):raise HTTPException(422,'Configure a serial port first')
+        target=dict(b,mode=transport)
+        checks=b.setdefault('connection_checks',{})
+        try:
+            result=redact(adapter(target).inspect())
+        except Exception as exc:
+            message=redact(str(exc))
+            checks[transport]={'status':'failed','checked_at':now(),'error':message}
+            with connection() as c:c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
+            raise HTTPException(400,message)
+        checks[transport]={'status':'verified','checked_at':now(),'snapshot':result}
+        # boot ID confirms both connections reached the same running kernel;
+        # differing IDs may mean different boards or a reboot between checks.
+        peer=checks.get('uart' if transport=='ssh' else 'ssh',{})
+        same_boot=None
+        if peer.get('status')=='verified':same_boot=peer['snapshot']['boot_id']==result['boot_id']
         b['verified_at']=now();b['capabilities']=result
         with connection() as c:c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
-        return result
+        return dict(result,transport=transport,same_boot_as_other_connection=same_boot)
 
 
 @app.post('/api/scripts',status_code=201)
@@ -368,6 +439,7 @@ def create_script(body:ScriptInput):
 def create_run(body:RunInput):
     with BOARD_GATE:
         board=item('boards',body.board_id)
+        if board['mode']=='uart':raise HTTPException(422,'UART currently supports connection verification only. Run tests through SSH.')
         if board['mode']=='ssh' and body.test=='reboot' and not body.allow_reboot:raise HTTPException(422,'Explicitly confirm rebooting this physical board')
         script=None
         if body.test=='custom':

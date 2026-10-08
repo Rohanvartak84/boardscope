@@ -8,3 +8,11 @@ Verified in this environment on 2026-10-08, using Python 3.12.
 - One upstream test-client deprecation warning was emitted; tests use the installed httpx compatibility path.
 
 Not verified: physical RISC-V hardware, UART capture on hardware, Ubuntu/Yocto image compatibility on that board, actual SSH reboot permissions, actual local model inference, fleet throughput or browser visual layout/accessibility. A Chromium download failed in this environment; DOM checks were used instead. This is an engineering preview, not a production release.
+
+## Connection milestone 0.2
+
+20 Python checks pass locally, including the existing workflows plus session-only password handling, validation/error redaction, explicit SSH password authentication, editable connections, independent SSH/UART verification, UART run blocking, bootloader refusal and real pyserial I/O through Linux pseudo-terminals emulating automatic shell and username/password login. The fixed identity script reads the test host; no physical board is contacted.
+
+The DOM harness now also exercises SSH password board registration, connection editing, saved-transport buttons and forgetting session passwords. It uses a live local service with disposable data and never opens a network connection to the fake board.
+
+Physical UART/SSH acceptance on the user's RISC-V board and browser visual rendering remain unverified.

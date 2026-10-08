@@ -3,6 +3,7 @@ import shlex
 import time
 import uuid
 from pathlib import Path
+from .credentials import get_secret
 
 
 class Simulator:
@@ -49,10 +50,18 @@ class SSHBoard:
         c.load_system_host_keys()
         c.set_missing_host_key_policy(paramiko.RejectPolicy())
         try:
-            c.connect(self.board['host'], port=self.board['port'], username=self.board['username'], key_filename=self.board.get('key_path') or None, timeout=8, auth_timeout=8, banner_timeout=8, allow_agent=True, look_for_keys=True)
+            password_mode=self.board.get('auth_method','key')=='password'
+            password=get_secret(self.board.get('id'), 'ssh_password') if password_mode else None
+            if password_mode and not password:
+                raise RuntimeError('SSH password is missing for this session. Open Connect and enter it again.')
+            c.connect(self.board['host'], port=self.board['port'], username=self.board['username'], key_filename=None if password_mode else self.board.get('key_path') or None, password=password, timeout=8, auth_timeout=8, banner_timeout=8, allow_agent=not password_mode, look_for_keys=not password_mode)
             return c
-        except Exception:
+        except Exception as exc:
             c.close()
+            if isinstance(exc, paramiko.AuthenticationException):
+                raise RuntimeError('SSH authentication failed. Check the username and selected password/key.') from None
+            if isinstance(exc, paramiko.BadHostKeyException):
+                raise RuntimeError('SSH host key changed. Verify the board fingerprint before updating known_hosts.') from None
             raise
 
     def command(self, command, timeout=15, stdin_text=None):
@@ -121,4 +130,8 @@ printf 'COMMANDS='; for c in sh ip dmesg reboot; do command -v "$c" >/dev/null 2
 
 
 def adapter(board):
-    return Simulator(board) if board['mode'] == 'simulator' else SSHBoard(board)
+    if board['mode']=='simulator':return Simulator(board)
+    if board['mode']=='uart':
+        from .uart import UARTBoard
+        return UARTBoard(board)
+    return SSHBoard(board)
