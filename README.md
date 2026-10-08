@@ -1,4 +1,4 @@
-# BoardScope 0.2 — local engineering preview
+# BoardScope 0.2.1 — local engineering preview
 
 A runnable first version of the embedded Linux test workbench. The browser dashboard talks to a local Python service. The service runs a simulator or SSH commands on a configured board and saves results on the lab PC. No Docker, board-side package, cloud account or frontend build is required.
 
@@ -91,4 +91,14 @@ The UART verifier listens for a plain Linux `login:` / `Password:` prompt or an 
 
 SSH and UART each show their last verification result, timestamp and error. These are point-in-time checks, not continuous connectivity indicators. Matching boot UUIDs indicate the two checks reached the same running kernel; a mismatch can mean a different board or a reboot between checks and requires investigation. Capability snapshots do not provide permanent hardware identity.
 
-UART-only boards can be registered and verified. **UART reboot/test execution, live console streaming and automatic SSH fallback are not part of this milestone.** SSH test execution and optional read-only serial capture remain as before. Password login does not grant reboot privileges; SSH reboot still requires noninteractive `sudo -n /sbin/reboot` permission.
+UART-only boards can be registered, verified and used for Linux inventory tests. **UART reboot/custom-script execution, live console streaming and automatic SSH fallback are not implemented. UART Linux inventory runs are supported in 0.2.1.** SSH test execution and optional read-only serial capture remain as before. Password login does not grant reboot privileges; SSH reboot still requires noninteractive `sudo -n /sbin/reboot` permission.
+
+## Start Linux inventory through UART (0.2.1)
+
+1. Save and verify the UART connection, including the appropriate Linux console login and optional Send Enter setting.
+2. Click **Start test** on the board card. UART boards are included in the run dialog.
+3. Select **Test connection → UART** and **Linux inventory**. A board registered primarily for SSH can also select UART when its serial port is configured; saving a UART verification alone does not change the test transport.
+4. Set cycles, interval and failure policy, then start. BoardScope logs into the console once and retains that serial session across the run. It reads Linux readiness/boot identity, the expected interface, optional sound-card count and available kernel evidence. No SSH connection is attempted for a UART run.
+5. The run history, detail view and JSON plan identify UART as the execution transport. Results remain subject to explicit expected inventory rules; interface presence does not prove network connectivity.
+
+UART reboot and custom-script options are disabled in the UI and rejected by the API. One session owns reads/writes during a UART run; the SSH run's separate serial capture thread is not started. This milestone does not provide a live serial stream or continuous raw serial transcript. Close other terminal applications before testing. Stop is observed between bounded inventory commands and releases the serial session. Keep Send Enter enabled only when you know the board is at a Linux login/shell.

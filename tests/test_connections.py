@@ -84,14 +84,16 @@ def test_edit_connection_keeps_blank_session_password_and_verifies_both(client,m
     assert states['ssh']['status']==states['uart']['status']=='verified'
 
 
-def test_uart_tests_are_explicitly_blocked(client):
+def test_unsupported_uart_tests_are_explicitly_blocked(client):
     b=client.post('/api/boards',json={'name':'Serial','mode':'uart','serial_port':'/dev/ttyTEST'}).json()
-    assert client.post('/api/runs',json={'board_id':b['id']}).status_code==422
+    for test in ('reboot','custom'):
+        assert client.post('/api/runs',json={'board_id':b['id'],'test':test}).status_code==422
 
 
 @pytest.mark.skipif(os.name!='posix',reason='Pseudo-terminal tests require POSIX')
 @pytest.mark.parametrize('login',[False,True])
-def test_uart_identity_via_real_serial_pseudoterminal(login):
+@pytest.mark.parametrize('persistent',[False,True])
+def test_uart_identity_via_real_serial_pseudoterminal(login,persistent):
     import pty
     master,slave=pty.openpty();path=os.ttyname(slave);done=threading.Event();received=[];errors=[]
     def emulator():
@@ -119,12 +121,17 @@ def test_uart_identity_via_real_serial_pseudoterminal(login):
     try:
         set_credentials('pty-board',uart_password='fake-password')
         a=UARTBoard({'id':'pty-board','serial_port':path,'baud':115200,'uart_username':'engineer'})
+        if persistent:a.open()
         snapshot=a.inspect()
+        if persistent:
+            for _ in range(2):assert a.inspect()['boot_id']==snapshot['boot_id']
+            a.close()
         assert snapshot['machine'] and snapshot['transport']=='uart'
         assert 'lo' in snapshot['interfaces']
         assert 'fake-password' not in json.dumps(snapshot)
         assert not errors
     finally:
+        if 'a' in locals():a.close()
         done.set();thread.join(1);os.close(master);os.close(slave);clear_credentials()
 
 
@@ -138,3 +145,47 @@ def test_uart_bootloader_receives_no_credentials():
     a=UARTBoard({'id':'test','uart_username':'engineer','uart_wake':True})
     with pytest.raises(RuntimeError,match='Bootloader'):a._login(c,1)
     assert c.writes==[]
+
+
+def wait_run(client,rid):
+    end=time.monotonic()+5
+    while time.monotonic()<end:
+        r=client.get('/api/runs/'+rid).json()
+        if r['state'] not in module.ACTIVE:return r
+        time.sleep(.02)
+    raise AssertionError('UART run did not finish')
+
+
+@pytest.mark.parametrize('primary',['uart','ssh'])
+def test_uart_inventory_runner_uses_one_session_without_ssh_or_second_reader(client,monkeypatch,primary):
+    import serial
+    calls=[]
+    class FakeUART:
+        simulated=False
+        def open(self):calls.append('open')
+        def close(self):calls.append('close')
+        def inspect(self):
+            calls.append('inspect')
+            return {'boot_id':'00000000-0000-0000-0000-000000000001','interfaces':['end0'],'sound_cards':3,'machine':'riscv64','os':'Yocto','transport':'uart'}
+        def ready(self):return self.inspect()
+        def evidence(self):return 'UART captured kernel evidence'
+    def select_adapter(b):
+        assert b['mode']=='uart','SSH must not be contacted'
+        return FakeUART()
+    def forbidden_reader(*args,**kwargs):raise AssertionError('A second serial reader must not open')
+    monkeypatch.setattr(module,'adapter',select_adapter)
+    monkeypatch.setattr(serial,'Serial',forbidden_reader)
+    b=client.post('/api/boards',json={'name':'UART inventory','mode':primary,'serial_port':'/dev/ttyTEST','host':'192.0.2.1','username':'engineer'}).json()
+    response=client.post('/api/runs',json={'board_id':b['id'],'transport':'uart','test':'inventory','cycles':3,'interval_s':0})
+    assert response.status_code==201,response.text
+    r=wait_run(client,response.json()['id'])
+    assert r['outcome']=='pass' and len(r['cycles'])==3
+    assert r['plan']['transport']=='uart' and r['board_snapshot']['mode']=='uart'
+    assert calls==['open','inspect','inspect','inspect','inspect','close']
+    assert all(c['snapshot']['transport']=='uart' for c in r['cycles'])
+    assert any('UART: Started inventory' in e['message'] for e in r['events'])
+
+
+def test_uart_transport_requires_a_port(client):
+    b=client.post('/api/boards',json={'name':'SSH only','mode':'ssh','host':'192.0.2.1','username':'engineer'}).json()
+    assert client.post('/api/runs',json={'board_id':b['id'],'transport':'uart','test':'inventory'}).status_code==422

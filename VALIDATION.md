@@ -16,3 +16,9 @@ Not verified: physical RISC-V hardware, UART capture on hardware, Ubuntu/Yocto i
 The DOM harness now also exercises SSH password board registration, connection editing, saved-transport buttons and forgetting session passwords. It uses a live local service with disposable data and never opens a network connection to the fake board.
 
 Physical UART/SSH acceptance on the user's RISC-V board and browser visual rendering remain unverified.
+
+## UART inventory milestone 0.2.1
+
+25 backend checks pass locally. Additional coverage checks inventory dispatch from UART and SSH-primary boards, recorded UART transport, one open/close per run, no SSH or separate serial-reader access, missing-port validation, unsupported UART test rejection, and repeated inventory commands over a retained real pyserial pseudo-terminal session with automatic-shell and password-login emulation.
+
+The live-service DOM harness verifies the UART board's Start test action, default/selected UART transport, disabled reboot/custom options, UART run labels and an explicit missing-device failure using a deliberately nonexistent serial path. Physical hardware and browser visual rendering are not verified here.
