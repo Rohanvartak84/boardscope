@@ -76,3 +76,9 @@ Flashing, manufacturing screening, Android/ADB, performance qualification and ce
 New API behavior: POST `/api/boards/{id}/connection` edits settings while idle; POST `/api/boards/{id}/forget-passwords` clears memory-only secrets while idle; GET `/api/serial-ports` lists local devices; POST `/api/boards/{id}/verify` accepts an optional transport of ssh, uart or simulator and saves separate last-check states. Password values are not present in responses or persisted metadata. Known host verification still applies to password-based SSH.
 
 Continuous UART streaming, serial command/log ownership during test runs, hardware identity, trusted SSH reconnection after IP changes, and credential-manager storage remain next milestones.
+
+## UART inventory milestone (0.2.1)
+
+RunInput adds an optional explicit transport (ssh/uart/simulator), defaulting to the board's primary mode for compatibility. Run creation validates physical/simulator boundaries, serial/SSH configuration, and UART's inventory-only capability. The immutable run plan records the resolved transport; the board snapshot's mode selects that adapter without changing the saved board configuration.
+
+UARTBoard now exposes open/close session methods. Verification still opens and closes a temporary session, while the worker retains a logged-in serial session across inventory cycles and closes it on success, error, cancellation or shutdown. UART command I/O has a single reader; the independent serial capture thread is used only by SSH runs. Reboot/custom UART execution and automatic transport fallback remain blocked.

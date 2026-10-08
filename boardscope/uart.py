@@ -1,6 +1,6 @@
 """Bounded UART login and read-only Linux identity verification.
 
-No run execution or automatic reset through UART in this milestone.
+Supports read-only inventory runs. Automatic reset is not implemented.
 """
 import re
 import shlex
@@ -25,19 +25,43 @@ class UARTBoard(SSHBoard):
     def client(self):
         raise RuntimeError('UART does not use an SSH client')
 
-    def command(self, command, timeout=15, stdin_text=None):
+    def __init__(self,board):
+        super().__init__(board)
+        self._handle=None
+        self._lock=None
+
+    def open(self,timeout=15):
         import serial
+        if self._handle is not None:return
         port=self.board.get('serial_port')
         if not port:raise RuntimeError('Select a serial port first')
         with _GUARD:lock=_PORT_LOCKS.setdefault(port,threading.Lock())
         if not lock.acquire(blocking=False):raise RuntimeError('Serial port busy in BoardScope')
-        handle=None
+        self._lock=lock
         try:
             try:
-                handle=serial.Serial(port,self.board.get('baud',115200),timeout=.1,write_timeout=2,exclusive=True)
+                self._handle=serial.Serial(port,self.board.get('baud',115200),timeout=.1,write_timeout=2,exclusive=True)
             except (OSError,serial.SerialException):
                 raise RuntimeError('Cannot open serial port. Check the device path, host permissions and other terminal applications.') from None
-            self._login(handle,timeout)
+            self._login(self._handle,timeout)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        try:
+            if self._handle is not None:self._handle.close()
+        finally:
+            self._handle=None
+            if self._lock is not None:
+                self._lock.release()
+                self._lock=None
+
+    def command(self, command, timeout=15, stdin_text=None):
+        temporary=self._handle is None
+        if temporary:self.open(timeout)
+        handle=self._handle
+        try:
             script=stdin_text if stdin_text is not None else command
             marker='BS_'+uuid.uuid4().hex
             # Single-line command even for a multiline script, using POSIX printf
@@ -56,8 +80,7 @@ class UARTBoard(SSHBoard):
                     return int(last.group(1)),text[first.end():last.start()].replace('\r',''),''
             raise TimeoutError('Linux shell command did not finish before the UART deadline')
         finally:
-            if handle:handle.close()
-            lock.release()
+            if temporary:self.close()
 
     def _login(self, handle, timeout):
         text='';deadline=time.monotonic()+timeout;sent_user=False;sent_password=False;woke=False;opened=time.monotonic()

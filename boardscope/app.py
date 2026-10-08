@@ -141,6 +141,7 @@ class ScriptInput(BaseModel):
 
 class RunInput(BaseModel):
     board_id: str
+    transport: Literal['ssh','uart','simulator'] | None = None
     test: Literal['inventory','reboot','custom'] = 'inventory'
     cycles: int = Field(default=10, ge=1, le=1000)
     timeout_s: int = Field(default=90, ge=5, le=600)
@@ -194,10 +195,13 @@ def check_snapshot(s, board, boot_before=None):
 def run_worker(run_id):
     r = item('runs', run_id); board = r['board_snapshot']; plan = r['plan']; a = adapter(board)
     r=patch_run(run_id, {'state':'running','started_at':now()}, states=('queued',))
-    event(run_id, ('SIMULATOR: ' if a.simulated else 'SSH: ') + 'Started ' + plan['test'])
+    event(run_id, ('SIMULATOR: ' if a.simulated else board['mode'].upper()+': ') + 'Started ' + plan['test'])
     serial_handle = None; capture_stop = threading.Event(); capture_thread = None; serial_text=[]
     try:
-        if not a.simulated and board.get('serial_port'):
+        if not await_control(run_id):return
+        if board['mode']=='uart':
+            a.open()
+        if board['mode']=='ssh' and board.get('serial_port'):
             import serial
             serial_handle=serial.Serial(board['serial_port'], board['baud'], timeout=.2)
             def capture():
@@ -279,6 +283,9 @@ def run_worker(run_id):
         capture_stop.set()
         if capture_thread:capture_thread.join(timeout=1)
         if serial_handle:serial_handle.close()
+        if board['mode']=='uart':
+            try:a.close()
+            except Exception:event(run_id,'UART close failed; check the local serial device','warning')
         with connection() as c:
             c.execute('BEGIN IMMEDIATE')
             r=json.loads(c.execute('SELECT data FROM runs WHERE id=?',(run_id,)).fetchone()['data'])
@@ -340,7 +347,7 @@ def state():
     for r in runs:
         if r.get('script_snapshot'):
             r['script_snapshot']={k:v for k,v in r['script_snapshot'].items() if k!='source'}
-    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.2.0','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
+    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.2.1','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
 
 
 def save_board(body, bid=None):
@@ -439,7 +446,16 @@ def create_script(body:ScriptInput):
 def create_run(body:RunInput):
     with BOARD_GATE:
         board=item('boards',body.board_id)
-        if board['mode']=='uart':raise HTTPException(422,'UART currently supports connection verification only. Run tests through SSH.')
+        transport=body.transport or board['mode']
+        if (board['mode']=='simulator') != (transport=='simulator'):
+            raise HTTPException(422,'Simulator and physical transports cannot be mixed')
+        if transport=='uart':
+            if body.test!='inventory':raise HTTPException(422,'UART supports Linux inventory only; reboot and custom tests require SSH')
+            if not board.get('serial_port'):raise HTTPException(422,'Configure a UART serial port first')
+        if transport=='ssh' and (not board.get('host') or not board.get('username')):
+            raise HTTPException(422,'Configure SSH host and username first')
+        board=dict(board,mode=transport)
+        body.transport=transport
         if board['mode']=='ssh' and body.test=='reboot' and not body.allow_reboot:raise HTTPException(422,'Explicitly confirm rebooting this physical board')
         script=None
         if body.test=='custom':
