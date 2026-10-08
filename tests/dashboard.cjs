@@ -1,0 +1,42 @@
+const {JSDOM}=require('jsdom');
+const fs=require('fs');
+const assert=require('node:assert/strict');
+(async()=>{
+ const base=process.env.BOARDSCOPE_TEST_URL||'http://127.0.0.1:8000';
+ let html;for(let i=0;i<50;i++){try{html=await (await fetch(base)).text();break}catch(e){await new Promise(r=>setTimeout(r,100))}}if(!html)throw Error('Server unavailable');
+ const dom=new JSDOM(html,{url:base,runScripts:'outside-only',pretendToBeVisual:true});
+ const w=dom.window,d=w.document,errors=[];
+ w.fetch=(url,args)=>fetch(new URL(url,base),args);
+ w.HTMLDialogElement.prototype.showModal=function(){this.open=true};
+ w.HTMLDialogElement.prototype.close=function(){this.open=false};
+ w.addEventListener('error',e=>errors.push(e.message));
+ w.eval(fs.readFileSync(require('node:path').join(__dirname,'../boardscope/static/app.js'),'utf8'));
+ const q=s=>d.querySelector(s);
+ async function wait(fn){for(let i=0;i<150;i++){if(fn())return;await new Promise(r=>setTimeout(r,50))}throw Error('UI wait failed. '+d.body.textContent.slice(-1800));}
+ await wait(()=>d.querySelectorAll('.board').length===2);
+ assert(d.body.textContent.includes('AI model not configured'));
+ async function run(env,policy){q('#new-run').click();let form=q('#form');const board=[...form.elements.board_id.options].find(o=>o.textContent.includes(env));form.elements.board_id.value=board.value;form.elements.test.value='reboot';form.elements.cycles.value=4;form.elements.interval_s.value=0;form.elements.failure_policy.value=policy;form.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));await wait(()=>!q('#dialog').open);}
+ await run('Ubuntu','continue');
+ await wait(()=>q('.run-summary .row.spread > span')?.textContent==='completed');
+ assert(q('#content').textContent.includes('4 / 4 cycles'));
+ assert(q('#content').textContent.includes('SIMULATED'));
+ q('#back').click();
+ await run('Yocto','pause');
+ await wait(()=>q('[data-control="resume"]'));
+ assert(q('#content').textContent.includes('expected 3 / observed 2'));
+ q('#investigate').click();
+ await wait(()=>q('#content').textContent.includes('Evidence comparison · AI not configured'));
+ assert(q('#content').textContent.includes('expected 3, observed 2'));
+ q('[data-control="resume"]').click();
+ await wait(()=>q('.run-summary .row.spread > span')?.textContent==='completed');
+ q('#back').click();q('[data-nav="tests"]').click();q('[data-add-script]').click();
+ q('#form').elements.name.value='Reviewed test';q('#form').elements.source.value='true';q('#form').elements.confirmed.checked=true;
+ q('#form').dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));
+ await wait(()=>!q('#dialog').open);assert(q('#content').textContent.includes('Reviewed test'));
+ q('[data-nav="boards"]').click();q('[data-add-board]').click();
+ const f=q('#form');f.elements.name.value='<img src=x onerror=alert(1)>';f.elements.mode.value='simulator';f.dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));
+ await wait(()=>!q('#dialog').open);assert(q('#content').textContent.includes('<img src=x onerror=alert(1)>'));assert(!q('#content img'));
+ assert.equal(errors.length,0,errors.join('\n'));
+ console.log('Dashboard live-service DOM checks passed: passing reboot, failure/pause, comparison, resume, custom script registration, board registration and escaping.');
+ dom.window.close();
+})().catch(e=>{console.error(e);process.exit(1)});
