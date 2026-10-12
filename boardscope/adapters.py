@@ -3,7 +3,8 @@ import shlex
 import time
 import uuid
 from pathlib import Path
-from .credentials import get_secret
+from .credentials import get_secret, sudo_secret
+from .transport import ActionUncertain, ActionRejected, HostTrustError
 
 
 class Simulator:
@@ -44,6 +45,12 @@ class SSHBoard:
     def __init__(self, board):
         self.board = board
 
+    def _connect_timeout(self):
+        deadline=getattr(self,'observation_deadline',None)
+        if deadline is None:return 8
+        if deadline<=time.monotonic():raise TimeoutError('Boot observation deadline reached')
+        return min(2,max(.1,deadline-time.monotonic()))
+
     def client(self):
         import paramiko
         c = paramiko.SSHClient()
@@ -54,17 +61,21 @@ class SSHBoard:
             password=get_secret(self.board.get('id'), 'ssh_password') if password_mode else None
             if password_mode and not password:
                 raise RuntimeError('SSH password is missing for this session. Open Connect and enter it again.')
-            c.connect(self.board['host'], port=self.board['port'], username=self.board['username'], key_filename=None if password_mode else self.board.get('key_path') or None, password=password, timeout=8, auth_timeout=8, banner_timeout=8, allow_agent=not password_mode, look_for_keys=not password_mode)
+            c.connect(self.board['host'], port=self.board['port'], username=self.board['username'], key_filename=None if password_mode else self.board.get('key_path') or None, password=password, timeout=self._connect_timeout(), auth_timeout=self._connect_timeout(), banner_timeout=self._connect_timeout(), allow_agent=not password_mode, look_for_keys=not password_mode)
             return c
         except Exception as exc:
             c.close()
             if isinstance(exc, paramiko.AuthenticationException):
                 raise RuntimeError('SSH authentication failed. Check the username and selected password/key.') from None
             if isinstance(exc, paramiko.BadHostKeyException):
-                raise RuntimeError('SSH host key changed. Verify the board fingerprint before updating known_hosts.') from None
+                raise HostTrustError('SSH host key changed. Verify the board fingerprint before updating known_hosts.') from None
+            if isinstance(exc,paramiko.SSHException) and 'known_hosts' in str(exc):
+                raise HostTrustError('SSH host key is not trusted. Verify the fingerprint and add the board to known_hosts.') from None
             raise
 
     def command(self, command, timeout=15, stdin_text=None):
+        if getattr(self,'observation_deadline',None) is not None:
+            timeout=min(timeout,max(.1,self.observation_deadline-time.monotonic()))
         c = self.client()
         try:
             si, so, se = c.exec_command(command, timeout=timeout)
@@ -110,10 +121,16 @@ printf 'COMMANDS='; for c in sh ip dmesg reboot; do command -v "$c" >/dev/null 2
         return {'boot_id': boot, 'kernel': fields.get('KERNEL'), 'machine': fields.get('MACHINE'), 'os': fields.get('OS'), 'interfaces': fields.get('INTERFACES', '').split(), 'sound_cards': int(fields.get('SOUND', '0')), 'commands': fields.get('COMMANDS', '').split(), 'simulated': False}
 
     def reset(self):
-        # Execution intent is journalled by the runner before this one command.
-        code, out, err = self.command('sudo -n /sbin/reboot', timeout=10)
-        if code:
-            raise RuntimeError('Reboot command rejected: ' + err[:500])
+        code,out,err=self.command('id -u')
+        if code:raise ActionRejected('Cannot determine reboot privileges')
+        if out.strip()=='0':cmd='/sbin/reboot';password=None
+        elif self.board.get('sudo_mode','noninteractive')=='password':
+            cmd="sudo -S -p '' /sbin/reboot";password=sudo_secret(self.board,'ssh')+'\n'
+        else:cmd='sudo -n /sbin/reboot';password=None
+        # Never retry an uncertain reset delivery.
+        try:code,out,err=self.command(cmd,timeout=10,stdin_text=password)
+        except Exception as exc:raise ActionUncertain('SSH reboot delivery is uncertain: '+str(exc)) from None
+        if code:raise ActionRejected('Reboot command rejected: '+err[:500])
 
     def ready(self):
         return self.inspect()
@@ -126,11 +143,15 @@ printf 'COMMANDS='; for c in sh ip dmesg reboot; do command -v "$c" >/dev/null 2
             return 'Kernel evidence unavailable: ' + str(e)
 
     def script(self, source, args, timeout):
-        return self.command('/bin/sh -s -- ' + ' '.join(shlex.quote(a) for a in args), timeout, source)
+        try:return self.command('/bin/sh -s -- ' + ' '.join(shlex.quote(a) for a in args), timeout, source)
+        except Exception as exc:raise ActionUncertain('SSH script result is uncertain: '+str(exc)+'. Inspect the board; the script was not replayed.') from None
 
 
 def adapter(board):
     if board['mode']=='simulator':return Simulator(board)
+    if board['mode']=='auto':
+        from .fallback import FallbackBoard
+        return FallbackBoard(board)
     if board['mode']=='uart':
         from .uart import UARTBoard
         return UARTBoard(board)

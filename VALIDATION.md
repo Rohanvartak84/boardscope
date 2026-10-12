@@ -22,3 +22,9 @@ Physical UART/SSH acceptance on the user's RISC-V board and browser visual rende
 25 backend checks pass locally. Additional coverage checks inventory dispatch from UART and SSH-primary boards, recorded UART transport, one open/close per run, no SSH or separate serial-reader access, missing-port validation, unsupported UART test rejection, and repeated inventory commands over a retained real pyserial pseudo-terminal session with automatic-shell and password-login emulation.
 
 The live-service DOM harness verifies the UART board's Start test action, default/selected UART transport, disabled reboot/custom options, UART run labels and an explicit missing-device failure using a deliberately nonexistent serial path. Physical hardware and browser visual rendering are not verified here.
+
+## Dual transport milestone 0.3
+
+39 backend checks pass locally. Coverage includes real pyserial pseudo-terminal console emulation for username/password login, root and password-sudo reboot, changed boot identity after re-login, credential echo redaction, rejected sudo, chunked scripts larger than a terminal line, shell-quoted arguments, combined console output, nonzero exit codes and uncertain timeout blocking. Fake adapters verify reboot recovery after SSH/IP loss without a second reset, custom execution stopping after an uncertain result, host-trust failure blocking fallback, action/pairing authorisation, and actual cycle transport metadata.
+
+The live-service DOM harness verifies sudo settings/editing, fallback selection and pairing confirmation, enabled UART test choices and existing workflows. No physical hardware was rebooted; no actual SSH server, real board sudo configuration, hardware UART reconnect behavior or browser layout has been validated here. Physical acceptance is required before unattended testing.

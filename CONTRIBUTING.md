@@ -27,3 +27,7 @@ Do not pull source changes into a running physical test. An interrupted run will
 - Optional credential persistence through an OS credential manager.
 
 The remaining items are planned; implemented connection features are documented in README.md. Implement them in small reviewed changes with prompt, timeout, redaction and reconnect tests before trying real hardware.
+
+## Implemented in 0.3
+
+SSH/UART reboot and reviewed custom scripts, root/password sudo modes and authorised SSH-first/UART fallback are implemented. Remaining work includes physical-board acceptance, wider prompt profiles, reliable hardware identity, IP discovery with host-key verification, continuous live console streaming and hard reset/power fixtures. Never test actual reboot code on the development host; use the emulators and mocked adapters.
