@@ -23,7 +23,7 @@ def get_secret(board_id, key):
 
 def credential_status(board_id):
     with _LOCK:
-        return {key: bool(_VALUES.get(board_id, {}).get(key)) for key in ('ssh_password','uart_password')}
+        return {key: bool(_VALUES.get(board_id, {}).get(key)) for key in ('ssh_password','uart_password','sudo_password')}
 
 
 def clear_credentials():
@@ -43,3 +43,13 @@ def redact(value):
     if isinstance(value, list):
         return [redact(v) for v in value]
     return value
+
+
+def sudo_secret(board,transport):
+    key=(transport+'_password') if board.get('sudo_password_source','login')=='login' else 'sudo_password'
+    password=get_secret(board.get('id'),key)
+    if not password:
+        raise RuntimeError('Sudo password is missing for this session. Enter it in Connect / settings.')
+    if any(c in password for c in ('\r','\n')):
+        raise RuntimeError('Sudo passwords cannot contain newline characters')
+    return password

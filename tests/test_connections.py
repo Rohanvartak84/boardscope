@@ -84,7 +84,7 @@ def test_edit_connection_keeps_blank_session_password_and_verifies_both(client,m
     assert states['ssh']['status']==states['uart']['status']=='verified'
 
 
-def test_unsupported_uart_tests_are_explicitly_blocked(client):
+def test_uart_physical_actions_require_authorisation(client):
     b=client.post('/api/boards',json={'name':'Serial','mode':'uart','serial_port':'/dev/ttyTEST'}).json()
     for test in ('reboot','custom'):
         assert client.post('/api/runs',json={'board_id':b['id'],'test':test}).status_code==422

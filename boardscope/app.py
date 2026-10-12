@@ -22,6 +22,7 @@ from fastapi.exceptions import RequestValidationError
 from .credentials import set_credentials, credential_status, clear_credentials, redact
 
 from .adapters import adapter
+from .transport import ActionUncertain, ActionRejected, HostTrustError
 
 ACTIVE = ('queued', 'running', 'pausing', 'paused', 'stopping')
 STOP = threading.Event()
@@ -114,6 +115,9 @@ class BoardInput(BaseModel):
     auth_method: Literal['key','password'] = 'key'
     ssh_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
     uart_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
+    sudo_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
+    sudo_mode: Literal['noninteractive','password'] = 'noninteractive'
+    sudo_password_source: Literal['login','separate'] = 'login'
     uart_username: str = Field(default='', max_length=64)
     uart_wake: bool = False
     key_path: str = Field(default='', max_length=512)
@@ -141,7 +145,8 @@ class ScriptInput(BaseModel):
 
 class RunInput(BaseModel):
     board_id: str
-    transport: Literal['ssh','uart','simulator'] | None = None
+    transport: Literal['ssh','uart','auto','simulator'] | None = None
+    allow_fallback: bool = False
     test: Literal['inventory','reboot','custom'] = 'inventory'
     cycles: int = Field(default=10, ge=1, le=1000)
     timeout_s: int = Field(default=90, ge=5, le=600)
@@ -192,6 +197,14 @@ def check_snapshot(s, board, boot_before=None):
     return checks
 
 
+def drain_transport_events(a,run_id):
+    notes=a.drain_events() if hasattr(a,'drain_events') else []
+    for note in notes:event(run_id,note['message'],note['level'])
+    if notes:
+        patch_run(run_id,{'fallback_attempted':True,'fallback_used':getattr(a,'active',None)=='uart'})
+    return notes
+
+
 def run_worker(run_id):
     r = item('runs', run_id); board = r['board_snapshot']; plan = r['plan']; a = adapter(board)
     r=patch_run(run_id, {'state':'running','started_at':now()}, states=('queued',))
@@ -199,8 +212,10 @@ def run_worker(run_id):
     serial_handle = None; capture_stop = threading.Event(); capture_thread = None; serial_text=[]
     try:
         if not await_control(run_id):return
-        if board['mode']=='uart':
-            a.open()
+        if board['mode'] in ('uart','auto'):
+            if hasattr(a,'cancelled'):a.cancelled=lambda:STOP.is_set() or item('runs',run_id)['state']=='stopping'
+            if board['mode']=='uart':a.open()
+            elif hasattr(a,'uart'):a.uart.cancelled=lambda:STOP.is_set() or item('runs',run_id)['state']=='stopping'
         if board['mode']=='ssh' and board.get('serial_port'):
             import serial
             serial_handle=serial.Serial(board['serial_port'], board['baud'], timeout=.2)
@@ -220,20 +235,25 @@ def run_worker(run_id):
         if not await_control(run_id):
             return
         baseline = a.inspect(); event(run_id, 'Baseline: ' + json.dumps(baseline))
+        pending_notes=drain_transport_events(a,run_id)
         for n in range(1, plan['cycles']+1):
             if not await_control(run_id):
                 break
-            started=now(); tick=time.monotonic(); checks=[]; snapshot={}; logs=''; cycle_out='pass'; offset=len(serial_text)
+            started=now(); tick=time.monotonic(); checks=[]; snapshot={}; logs=''; cycle_out='pass'; offset=len(serial_text);fatal=False
+            if hasattr(a,'take_serial_log'):a.take_serial_log()
             try:
                 if plan['test']=='reboot':
                     before=a.inspect()['boot_id']
                     # Intent saved before a physical action, never transparently retried.
                     event(run_id, f'Cycle {n}: reset intent recorded; command will be issued once')
+                    a.observation_deadline=None
                     try:
                         a.reset()
+                    except ActionRejected:raise
                     except Exception as exc:
                         event(run_id, 'Reset delivery uncertain or rejected; verifying boot identity: '+str(exc),'warning')
                     deadline=time.monotonic()+plan['timeout_s']
+                    a.observation_deadline=deadline
                     last='No new boot observed'
                     while time.monotonic()<deadline:
                         if STOP.is_set() or item('runs',run_id)['state']=='stopping':
@@ -241,29 +261,40 @@ def run_worker(run_id):
                         try:
                             snapshot=a.ready()
                             if snapshot['boot_id']!=before:break
+                        except (HostTrustError,ActionUncertain):raise
                         except Exception as exc:last=str(exc)
                         time.sleep(.1 if a.simulated else 1)
                     else:raise TimeoutError('Boot/readiness deadline reached: '+last)
+                    a.observation_deadline=None
                     checks=check_snapshot(snapshot,board,before)
                 elif plan['test']=='inventory':
                     snapshot=a.ready();checks=check_snapshot(snapshot,board)
                 else:
                     script=r['script_snapshot']
                     if a.simulated:
-                        raise RuntimeError('Custom scripts require a real SSH board; simulator does not execute user code')
+                        raise RuntimeError('Custom scripts require a physical board; simulator does not execute user code')
                     code,out,err=a.script(script['source'],plan['args'],script['timeout_s'])
-                    logs='stdout:\n'+out+'\nstderr:\n'+err
+                    logs=('Console stdout/stderr combined:\n' if (getattr(a,'active',None) or board['mode'])=='uart' else 'stdout:\n')+out+'\nstderr:\n'+err
                     checks=[{'name':script['name'],'outcome':'pass' if code==0 else 'fail','expected':'exit code 0','actual':code}]
                 if any(c['outcome']=='fail' for c in checks):cycle_out='fail'
                 logs += '\n'+a.evidence()
             except InterruptedError as exc:
                 cycle_out='cancelled';logs=str(exc)
+            except (ActionUncertain,HostTrustError) as exc:
+                cycle_out='error';fatal=True;logs=str(exc)
             except Exception as exc:
                 cycle_out='error';logs=str(exc)+'\n'+a.evidence()
-            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(''.join(serial_text[offset:]))[:262144],'simulated':a.simulated}
+            a.observation_deadline=None
+            connection_notes=pending_notes+drain_transport_events(a,run_id);pending_notes=[]
+            serial_log=''.join(serial_text[offset:])
+            if hasattr(a,'take_serial_log'):serial_log+=a.take_serial_log()
+            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(serial_log)[:262144],'transport':getattr(a,'active',None) or board['mode'],'connection_notes':connection_notes,'simulated':a.simulated}
             with connection() as c:c.execute('INSERT INTO cycles VALUES(?,?,?,?)',(cycle['id'],run_id,n,json.dumps(cycle)))
             event(run_id,f'Cycle {n}: {cycle_out}', 'error' if cycle_out in ('fail','error') else 'info')
             patch_run(run_id, {'completed_cycles':n})
+            if fatal:
+                event(run_id,'Run stopped because action state or host trust requires manual review. No action was replayed.','error')
+                break
             if cycle_out=='cancelled':break
             if cycle_out in ('fail','error'):
                 if plan['failure_policy']=='abort':break
@@ -280,10 +311,11 @@ def run_worker(run_id):
         event(run_id, 'Execution error: '+str(exc),'error')
         patch_run(run_id, {'message':redact(str(exc)),'outcome':'error'})
     finally:
+        drain_transport_events(a,run_id)
         capture_stop.set()
         if capture_thread:capture_thread.join(timeout=1)
         if serial_handle:serial_handle.close()
-        if board['mode']=='uart':
+        if board['mode'] in ('uart','auto'):
             try:a.close()
             except Exception:event(run_id,'UART close failed; check the local serial device','warning')
         with connection() as c:
@@ -347,7 +379,7 @@ def state():
     for r in runs:
         if r.get('script_snapshot'):
             r['script_snapshot']={k:v for k,v in r['script_snapshot'].items() if k!='source'}
-    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.2.1','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
+    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.3.0','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
 
 
 def save_board(body, bid=None):
@@ -366,7 +398,7 @@ def save_board(body, bid=None):
             old=item('boards',bid);b['created_at']=old['created_at']
             c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
         else:c.execute('INSERT INTO boards VALUES(?,?)',(b['id'],json.dumps(b)))
-    set_credentials(b['id'],ssh_password=body.ssh_password.get_secret_value() if body.ssh_password is not None else None,uart_password=body.uart_password.get_secret_value() if body.uart_password is not None else None)
+    set_credentials(b['id'],ssh_password=body.ssh_password.get_secret_value() if body.ssh_password is not None else None,uart_password=body.uart_password.get_secret_value() if body.uart_password is not None else None,sudo_password=body.sudo_password.get_secret_value() if body.sudo_password is not None else None)
     return dict(b,credential_status=credential_status(b['id']))
 
 
@@ -391,7 +423,7 @@ def update_board_connection(bid:str,body:BoardInput):
 def forget_passwords(bid:str):
     with BOARD_GATE:
         item('boards',bid);require_idle(bid)
-        set_credentials(bid,ssh_password='',uart_password='')
+        set_credentials(bid,ssh_password='',uart_password='',sudo_password='')
         return {'credential_status':credential_status(bid)}
 
 
@@ -449,17 +481,17 @@ def create_run(body:RunInput):
         transport=body.transport or board['mode']
         if (board['mode']=='simulator') != (transport=='simulator'):
             raise HTTPException(422,'Simulator and physical transports cannot be mixed')
-        if transport=='uart':
-            if body.test!='inventory':raise HTTPException(422,'UART supports Linux inventory only; reboot and custom tests require SSH')
+        if transport in ('uart','auto'):
             if not board.get('serial_port'):raise HTTPException(422,'Configure a UART serial port first')
-        if transport=='ssh' and (not board.get('host') or not board.get('username')):
+        if transport in ('ssh','auto') and (not board.get('host') or not board.get('username')):
             raise HTTPException(422,'Configure SSH host and username first')
+        if transport=='auto' and not body.allow_fallback:raise HTTPException(422,'Confirm SSH and UART profiles target the same board before allowing fallback')
         board=dict(board,mode=transport)
         body.transport=transport
-        if board['mode']=='ssh' and body.test=='reboot' and not body.allow_reboot:raise HTTPException(422,'Explicitly confirm rebooting this physical board')
+        if board['mode']!='simulator' and body.test=='reboot' and not body.allow_reboot:raise HTTPException(422,'Explicitly confirm rebooting this physical board')
         script=None
         if body.test=='custom':
-            if board['mode']!='ssh':raise HTTPException(422,'Custom scripts require an SSH board')
+            if board['mode']=='simulator':raise HTTPException(422,'Custom scripts require a physical board')
             if not body.script_id or not body.allow_script:raise HTTPException(422,'Select and explicitly authorise a reviewed script')
             script=item('scripts',body.script_id)
         r=dict(id=str(uuid.uuid4()),board_id=board['id'],board_snapshot=board,plan=body.model_dump(),script_snapshot=script,state='queued',outcome=None,completed_cycles=0,created_at=now(),simulated=board['mode']=='simulator')

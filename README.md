@@ -1,6 +1,29 @@
-# BoardScope 0.2.1 — local engineering preview
+# BoardScope 0.3 — local engineering preview
 
 A runnable first version of the embedded Linux test workbench. The browser dashboard talks to a local Python service. The service runs a simulator or SSH commands on a configured board and saves results on the lab PC. No Docker, board-side package, cloud account or frontend build is required.
+
+
+## Current test connections (0.3)
+
+| Run connection | Inventory | Software reboot | Reviewed custom scripts |
+| --- | --- | --- | --- |
+| SSH | Yes | Yes, root/passwordless sudo/password sudo | Yes |
+| UART | Yes | Yes, with boot UUID verification and console re-login | Yes, with bounded script transfer |
+| SSH → UART fallback | Yes | One reset through the selected connection; read-only recovery may use UART | Choose connection before execution; never replay an uncertain script |
+
+**Setup:** in Connect / settings, configure both profiles for the same physical board. Set **Built-in reboot privileges → Sudo needs a password** for a non-root account that needs a password. Choose either the selected transport's login password or a separate sudo password. Key-based SSH login usually needs a separate sudo password. Root is detected by `id -u` and does not use sudo. All three passwords remain memory-only and are cleared on restart or Forget passwords.
+
+**Run:** choose SSH, UART, or **SSH → UART fallback**, select inventory/reboot/custom, and authorise the requested action. Fallback requires explicitly confirming both profiles target the same board. It tries SSH first; if a connection/readiness read fails it switches to UART and stays there for the remainder of that run. Start a new run to try SSH again. Unknown/changed SSH host keys stop the run; fallback does not bypass host trust. There is no automatic IP discovery or rewrite of SSH host addresses in this release.
+
+SSH failures and UART fallback are recorded in events/cycles and shown in the dashboard. Inventory passing via UART is not proof that networking works. Reboot success requires a changed Linux boot UUID plus the configured inventory assertions. Reset intent is recorded before execution and a dispatched reset is never resent through the other connection.
+
+**Custom scripts:** select a registered, reviewed script and authorise it. UART uploads it in short POSIX printf chunks to an exclusively created mode-0600 file under `/tmp`, runs it once with individually quoted arguments, then removes the file after the script returns. The image must support `sh`, `printf`, `rm`, writable `/tmp`, and a normal serial Linux console. Sudo reboot support also requires `stty` and `sudo` for non-root accounts. UART stdout/stderr are combined; exit 0 passes, other exit codes fail. The configured UART timeout covers script transfer plus execution; choose a longer timeout for large scripts or slow baud rates. Script invocation must fit a 3500-byte terminal command line; oversized argument sets are rejected before script execution.
+
+Custom scripts run as the login account. The built-in sudo settings do **not** feed passwords into arbitrary script prompts; use scripts that run noninteractively with their required permissions. A timeout/disconnect after dispatch has an uncertain result: the run stops even with Continue on failure, does not replay the script, and skips further commands that might interfere with it. Target processes or temporary files may remain; inspect and clean them up before another run. Timeout is not a guarantee of target-side process termination.
+
+UART observes startup passively, does not send bootloader commands, and re-enters the Linux credentials only at recognised login/password prompts. Send Enter is used only for an explicitly confirmed idle Linux console, never during reboot observation. Serial evidence is bounded and collected while UART is reading login, boot or command output; it is not a continuous independent background stream in fallback mode. The UI's check status is a last-check snapshot, not a persistent liveness guarantee.
+
+Physical hard reset/power cycling, live console streaming and manufacturing fixtures remain outside this release. Validate on your real board starting with one inventory cycle, one small harmless custom script, and one authorised reboot before a long run.
 
 ## Start
 
@@ -33,14 +56,14 @@ BoardScope requires a Linux boot ID at `/proc/sys/kernel/random/boot_id`, `/sys`
 2. Register the name, OS label, SSH hostname/IP, username and port. Choose Password and enter the board password, or choose SSH key / agent and supply a private key path on the PC or use your SSH agent/default key. Private key contents are not stored in the database. Encrypted keys require an already loaded SSH agent.
 3. Set the expected interface to your board's name, such as `eth0` or `end0`; leave it blank to skip this assertion. Optional expected sound-card count must match your hardware. An interface inventory check is not a connectivity test.
 4. Verify the connection, then run Linux inventory first.
-5. For reboot testing, the account must already have permission for non-interactive `sudo -n /sbin/reboot`. This first version does not modify sudoers and does not support root-only reboot commands or a custom reset command. Confirm authorisation in the run form.
+5. For reboot testing, the account must already have permission for non-interactive `sudo -n /sbin/reboot`. This release does not modify sudoers. It supports direct /sbin/reboot for root and built-in sudo modes, but not a custom reset command. Confirm authorisation in the run form.
 6. Optionally enter a serial device path on the host and baud rate. The host must already have permissions, and another application must not own the serial port. Serial capture is read-only. SSH remains required to control the board.
 
 The runner records reset intent, issues one command, and checks for a changed boot UUID. SSH disconnect does not itself prove a reboot. Rejected or uncertain reset delivery is recorded and observed until the deadline; the runner never blindly sends another reset command. A boot deadline can be exceeded by the current bounded SSH connection/command attempt.
 
 ## Custom tests
 
-Register a reviewed POSIX shell script in Test library. Scripts are immutable records with a SHA-256 hash; register a new copy when changing one. Select the script in a custom run on a physical SSH board. Arguments are a JSON array of strings, shell-quoted individually. The dashboard requires explicit authorisation before starting.
+Register a reviewed POSIX shell script in Test library. Scripts are immutable records with a SHA-256 hash; register a new copy when changing one. Select the script in a custom run on a physical board using SSH, UART or authorised fallback. Arguments are a JSON array of strings, shell-quoted individually. The dashboard requires explicit authorisation before starting.
 
 Exit code 0 passes; a nonzero code fails; timeout/transport failures are errors. Commands run as the registered SSH account, with its permissions. There is no board-side sandbox. At timeout, BoardScope closes the SSH connection; target processes or children may survive, so scripts must manage cleanup and cancellation. Stop waits for an in-flight custom command's bounded timeout and cannot undo changes. No arbitrary custom code executes inside the simulator.
 
@@ -91,7 +114,7 @@ The UART verifier listens for a plain Linux `login:` / `Password:` prompt or an 
 
 SSH and UART each show their last verification result, timestamp and error. These are point-in-time checks, not continuous connectivity indicators. Matching boot UUIDs indicate the two checks reached the same running kernel; a mismatch can mean a different board or a reboot between checks and requires investigation. Capability snapshots do not provide permanent hardware identity.
 
-UART-only boards can be registered, verified and used for Linux inventory tests. **UART reboot/custom-script execution, live console streaming and automatic SSH fallback are not implemented. UART Linux inventory runs are supported in 0.2.1.** SSH test execution and optional read-only serial capture remain as before. Password login does not grant reboot privileges; SSH reboot still requires noninteractive `sudo -n /sbin/reboot` permission.
+UART-only boards can be registered, verified and used for Linux inventory tests. The current 0.3 transport capabilities and limitations are listed above; earlier connection milestones are described below for context. SSH test execution and optional read-only serial capture remain as before. Password login does not grant reboot privileges; SSH reboot still requires noninteractive `sudo -n /sbin/reboot` permission.
 
 ## Start Linux inventory through UART (0.2.1)
 
@@ -101,4 +124,4 @@ UART-only boards can be registered, verified and used for Linux inventory tests.
 4. Set cycles, interval and failure policy, then start. BoardScope logs into the console once and retains that serial session across the run. It reads Linux readiness/boot identity, the expected interface, optional sound-card count and available kernel evidence. No SSH connection is attempted for a UART run.
 5. The run history, detail view and JSON plan identify UART as the execution transport. Results remain subject to explicit expected inventory rules; interface presence does not prove network connectivity.
 
-UART reboot and custom-script options are disabled in the UI and rejected by the API. One session owns reads/writes during a UART run; the SSH run's separate serial capture thread is not started. This milestone does not provide a live serial stream or continuous raw serial transcript. Close other terminal applications before testing. Stop is observed between bounded inventory commands and releases the serial session. Keep Send Enter enabled only when you know the board is at a Linux login/shell.
+The 0.3 update enables UART reboot/custom-script tests and authorised SSH → UART fallback; see Current test connections above. One session owns reads/writes during a UART run; the SSH run's separate serial capture thread is not started. This milestone does not provide a live serial stream or continuous raw serial transcript. Close other terminal applications before testing. Stop is observed between bounded inventory commands and releases the serial session. Keep Send Enter enabled only when you know the board is at a Linux login/shell.
