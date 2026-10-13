@@ -36,3 +36,8 @@ The live-service DOM harness verifies sudo settings/editing, fallback selection 
 ## SSH-first dashboard redesign
 
 Live-service DOM checks cover the three-step home, compact cards, SSH-only quick setup/editing and blank secret fields, advanced profile access, preserved old workflows, collapsed run options, and test-dependent custom/reboot controls. JavaScript syntax passes. No backend execution changes are introduced. Browser visual rendering and physical board behavior remain unverified.
+
+
+### Result guidance and management
+
+Added mocked workflow coverage for baseline error location, custom-script stdout/stderr and exit codes, script-edit snapshot preservation, board removal/history/password clearing and active-run removal rejection. Live-service DOM checks cover script viewing/editing, failure guidance, storage disclosure and confirmed board removal. JavaScript syntax and Python workflow tests are required. Physical hardware and visual browser layout remain unverified.

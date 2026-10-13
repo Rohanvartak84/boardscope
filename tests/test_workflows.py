@@ -163,3 +163,69 @@ def test_local_ai_uses_local_endpoint_and_saves_reviewable_result(client,monkeyp
     assert response.status_code==200
     actual=client.get('/api/runs/'+r['id']).json()
     assert actual['outcome']=='fail' and actual['investigation']['mode']=='local_ai'
+
+
+def test_script_edit_preserves_run_snapshot(client,monkeypatch):
+    class Fake:
+        simulated=False
+        def inspect(self):return {'boot_id':'mock'}
+        def script(self,*args):return 0,'ok',''
+        def evidence(self):return 'mock'
+    monkeypatch.setattr(module,'adapter',lambda b:Fake())
+    board=client.post('/api/boards',json={'name':'mock','mode':'ssh','host':'192.0.2.1','username':'user'}).json()
+    script=client.post('/api/scripts',json={'name':'original','source':'echo original','confirmed':True}).json()
+    assert client.get('/api/scripts/'+script['id']).json()['source']=='echo original'
+    run=client.post('/api/runs',json={'board_id':board['id'],'test':'custom','script_id':script['id'],'allow_script':True,'cycles':1}).json()
+    wait(client,run['id'],lambda r:r['state']=='completed')
+    assert client.post('/api/scripts/'+script['id']+'/edit',json={'name':'edited','source':'echo edited'}).status_code==422
+    updated=client.post('/api/scripts/'+script['id']+'/edit',json={'name':'edited','source':'echo edited','confirmed':True}).json()
+    assert updated['version']==2 and updated['sha256']!=script['sha256']
+    assert client.get('/api/runs/'+run['id']).json()['script_snapshot']['sha256']==script['sha256']
+    assert module.item('runs',run['id'])['script_snapshot']['source']=='echo original'
+
+
+def test_remove_board_preserves_history_and_forgets_password(client):
+    r=start(client,cycles=1)
+    wait(client,r['id'],lambda r:r['state']=='completed')
+    module.set_credentials(r['board_id'],ssh_password='test-secret')
+    assert client.post('/api/boards/'+r['board_id']+'/delete',json={}).status_code==200
+    assert r['board_id'] not in [b['id'] for b in client.get('/api/state').json()['boards']]
+    assert client.get('/api/runs/'+r['id']).status_code==200
+    assert not module.credential_status(r['board_id'])['ssh_password']
+    assert client.post('/api/runs',json={'board_id':r['board_id']}).status_code==404
+
+
+def test_remove_active_board_rejected(client):
+    r=start(client,cycles=100,interval_s=.2)
+    assert client.post('/api/boards/'+r['board_id']+'/delete',json={}).status_code==409
+
+
+def test_baseline_failure_has_location_and_guidance(client,monkeypatch):
+    class Broken:
+        simulated=False
+        command_log=[{'command':'sh -s','error':'SSH authentication failed'}]
+        def inspect(self):raise RuntimeError('SSH authentication failed')
+    monkeypatch.setattr(module,'adapter',lambda b:Broken())
+    board=client.post('/api/boards',json={'name':'mock','mode':'ssh','host':'192.0.2.1','username':'user'}).json()
+    r=client.post('/api/runs',json={'board_id':board['id'],'cycles':1}).json()
+    done=wait(client,r['id'],lambda r:r['state']=='completed')
+    assert done['cycles']==[] and done['outcome']=='error'
+    assert done['failure']['stage']=='Baseline Linux readiness'
+    assert 'username' in str(done['failure']['next_checks'])
+    assert done['startup_evidence']['command_log'][0]['command']=='sh -s'
+    assert client.get('/api/state').json()['database_path']==str(module.DB.resolve())
+
+
+def test_cycle_failure_has_guidance_and_separate_script_output(client,monkeypatch):
+    class FailedScript:
+        simulated=False
+        def inspect(self):return {'boot_id':'mock'}
+        def script(self,*args):return 7,'device absent','permission denied'
+        def evidence(self):return 'mock kernel'
+    monkeypatch.setattr(module,'adapter',lambda b:FailedScript())
+    b=client.post('/api/boards',json={'name':'mock','mode':'ssh','host':'192.0.2.1','username':'user'}).json()
+    s=client.post('/api/scripts',json={'name':'check','source':'false','confirmed':True}).json()
+    r=client.post('/api/runs',json={'board_id':b['id'],'test':'custom','script_id':s['id'],'allow_script':True,'cycles':1,'failure_policy':'abort'}).json()
+    done=wait(client,r['id'],lambda r:r['state']=='completed');c=done['cycles'][0]
+    assert c['failure']['stage']=='Execute custom script'
+    assert c['script_output']=={'exit_code':7,'stdout':'device absent','stderr':'permission denied','combined':False}

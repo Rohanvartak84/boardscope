@@ -3,7 +3,7 @@ import shlex
 import time
 import uuid
 from pathlib import Path
-from .credentials import get_secret, sudo_secret
+from .credentials import get_secret, sudo_secret, redact
 from .transport import ActionUncertain, ActionRejected, HostTrustError
 
 
@@ -76,8 +76,9 @@ class SSHBoard:
     def command(self, command, timeout=15, stdin_text=None):
         if getattr(self,'observation_deadline',None) is not None:
             timeout=min(timeout,max(.1,self.observation_deadline-time.monotonic()))
-        c = self.client()
+        c = None;out,err=bytearray(),bytearray();record={'command':command,'exit_code':None}
         try:
+            c = self.client()
             si, so, se = c.exec_command(command, timeout=timeout)
             if stdin_text is not None:
                 si.write(stdin_text)
@@ -98,9 +99,16 @@ class SSHBoard:
                 if time.monotonic() >= deadline:
                     raise TimeoutError('SSH command timed out')
                 time.sleep(.02)
-            return channel.recv_exit_status(), out.decode(errors='replace'), err.decode(errors='replace')
+            record['exit_code']=channel.recv_exit_status()
+            return record['exit_code'], out.decode(errors='replace'), err.decode(errors='replace')
+        except Exception as exc:
+            record['error']=str(exc)
+            raise
         finally:
-            c.close()
+            record['truncated']=len(out)>16384 or len(err)>16384
+            record.update(stdout=out.decode(errors='replace')[:16384],stderr=err.decode(errors='replace')[:16384])
+            self.command_log=(getattr(self,'command_log',[])+[redact(record)])[-20:]
+            if c:c.close()
 
     def inspect(self):
         code, out, err = self.command("sh -s", stdin_text="""set -eu

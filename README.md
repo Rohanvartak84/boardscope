@@ -141,3 +141,14 @@ The dashboard begins with Connect your board → Run a test → Review the resul
 Board cards show the primary connection, address, credential/last-check state and Check/Edit/Start actions. Full saved profiles, UART and reboot configuration remain under Saved settings & other connections. The alternative full setup is explicitly available from the simple form; switching to it preserves the simple-form inputs in the unsaved draft. Existing configurations and test execution behavior are retained.
 
 Run options are collapsed by default; custom script fields and execution/reboot authorisations appear only for the selected test. The technical activity log is secondary to cycle results. Expanded saved-profile sections survive dashboard polling. The navigation labels are Dashboard, Boards, Tests and Results. This is the local application dashboard, not a public hosted website.
+
+
+### Results, saved scripts and board removal
+
+Results show the failure stage, exception type, failed expectations and suggested next checks. Guidance is deterministic and does not assert a root cause. Connection/baseline failures appear even if no cycle completed. Historical results receive guidance from existing evidence but explicitly mark the stage as unrecorded. Custom-script results separate stdout, stderr and exit code (UART combines console output). SSH command previews include command, return status and output, excluding stdin; previews retain the last 20 commands with 16 KiB per stream and show truncation. Kernel collection remains the last 180 dmesg lines; UART logs cover the capture period only, not a complete boot archive. JSON exports include the new evidence.
+
+Tests → View / edit loads the saved source, name and timeout. Saving requires review, increments the version and updates its hash. Already queued, active and completed runs retain their original script snapshots. Standard polling and reports still omit source; explicit local script viewing returns it.
+
+Boards → Remove board requires confirmation and rejects removal during active runs. Removal hides the board and forgets its passwords, while retaining the archived board record and past results in SQLite. It is not an erasure of test history.
+
+Boards also displays the actual database path on the PC running the server. Default: `~/.local/share/boardscope/boardscope.sqlite3`, overridden by `BOARDSCOPE_DATA`. IP/hostname, username, key path, UART settings, scripts and results are stored there. SSH/UART/sudo password values live only in server memory and disappear on restart; the dashboard shows availability, never the stored value. Keys remain in their original files.

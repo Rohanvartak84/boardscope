@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, SecretStr, field_validator
 from fastapi.exceptions import RequestValidationError
 from .credentials import set_credentials, credential_status, clear_credentials, redact
 
+from .diagnostics import diagnostic
 from .adapters import adapter
 from .transport import ActionUncertain, ActionRejected, HostTrustError
 
@@ -209,6 +210,7 @@ def run_worker(run_id):
     r = item('runs', run_id); board = r['board_snapshot']; plan = r['plan']; a = adapter(board)
     r=patch_run(run_id, {'state':'running','started_at':now()}, states=('queued',))
     event(run_id, ('SIMULATOR: ' if a.simulated else board['mode'].upper()+': ') + 'Started ' + plan['test'])
+    stage='Connection setup'
     serial_handle = None; capture_stop = threading.Event(); capture_thread = None; serial_text=[]
     try:
         if not await_control(run_id):return
@@ -234,24 +236,30 @@ def run_worker(run_id):
             capture_thread=threading.Thread(target=capture,daemon=True);capture_thread.start()
         if not await_control(run_id):
             return
+        stage='Baseline Linux readiness'
         baseline = a.inspect(); event(run_id, 'Baseline: ' + json.dumps(baseline))
         pending_notes=drain_transport_events(a,run_id)
         for n in range(1, plan['cycles']+1):
             if not await_control(run_id):
                 break
-            started=now(); tick=time.monotonic(); checks=[]; snapshot={}; logs=''; cycle_out='pass'; offset=len(serial_text);fatal=False
+            started=now(); tick=time.monotonic(); checks=[]; snapshot={}; logs=''; cycle_out='pass'; offset=len(serial_text);fatal=False;failure=None;script_output=None
+            if hasattr(a,'command_log'):a.command_log=[]
+            elif hasattr(a,'ssh'):a.ssh.command_log=[]
             if hasattr(a,'take_serial_log'):a.take_serial_log()
             try:
                 if plan['test']=='reboot':
+                    stage='Read boot identity before reboot'
                     before=a.inspect()['boot_id']
                     # Intent saved before a physical action, never transparently retried.
                     event(run_id, f'Cycle {n}: reset intent recorded; command will be issued once')
                     a.observation_deadline=None
                     try:
+                        stage='Issue software reboot'
                         a.reset()
                     except ActionRejected:raise
                     except Exception as exc:
                         event(run_id, 'Reset delivery uncertain or rejected; verifying boot identity: '+str(exc),'warning')
+                    stage='Wait for new boot and Linux readiness'
                     deadline=time.monotonic()+plan['timeout_s']
                     a.observation_deadline=deadline
                     last='No new boot observed'
@@ -266,29 +274,34 @@ def run_worker(run_id):
                         time.sleep(.1 if a.simulated else 1)
                     else:raise TimeoutError('Boot/readiness deadline reached: '+last)
                     a.observation_deadline=None
+                    stage='Validate inventory after reboot'
                     checks=check_snapshot(snapshot,board,before)
                 elif plan['test']=='inventory':
-                    snapshot=a.ready();checks=check_snapshot(snapshot,board)
+                    stage='Linux inventory readiness'
+                    snapshot=a.ready();stage='Validate Linux inventory';checks=check_snapshot(snapshot,board)
                 else:
                     script=r['script_snapshot']
                     if a.simulated:
                         raise RuntimeError('Custom scripts require a physical board; simulator does not execute user code')
+                    stage='Execute custom script'
                     code,out,err=a.script(script['source'],plan['args'],script['timeout_s'])
+                    script_output={'exit_code':code,'stdout':redact(out)[:262144],'stderr':redact(err)[:262144],'combined':(getattr(a,'active',None) or board['mode'])=='uart'}
                     logs=('Console stdout/stderr combined:\n' if (getattr(a,'active',None) or board['mode'])=='uart' else 'stdout:\n')+out+'\nstderr:\n'+err
                     checks=[{'name':script['name'],'outcome':'pass' if code==0 else 'fail','expected':'exit code 0','actual':code}]
-                if any(c['outcome']=='fail' for c in checks):cycle_out='fail'
+                if any(c['outcome']=='fail' for c in checks):
+                    cycle_out='fail';failure=diagnostic(stage,'CheckMismatch','One or more test checks failed',checks)
                 logs += '\n'+a.evidence()
             except InterruptedError as exc:
                 cycle_out='cancelled';logs=str(exc)
             except (ActionUncertain,HostTrustError) as exc:
-                cycle_out='error';fatal=True;logs=str(exc)
+                cycle_out='error';fatal=True;logs=str(exc);failure=diagnostic(stage,type(exc).__name__,str(exc))
             except Exception as exc:
-                cycle_out='error';logs=str(exc)+'\n'+a.evidence()
+                cycle_out='error';failure=diagnostic(stage,type(exc).__name__,str(exc));logs=str(exc)+'\n'+a.evidence()
             a.observation_deadline=None
             connection_notes=pending_notes+drain_transport_events(a,run_id);pending_notes=[]
             serial_log=''.join(serial_text[offset:])
             if hasattr(a,'take_serial_log'):serial_log+=a.take_serial_log()
-            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(serial_log)[:262144],'transport':getattr(a,'active',None) or board['mode'],'connection_notes':connection_notes,'simulated':a.simulated}
+            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'failure':failure,'script_output':script_output,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(serial_log)[:262144],'transport':getattr(a,'active',None) or board['mode'],'connection_notes':connection_notes,'command_log':getattr(getattr(a,'ssh',a),'command_log',[]),'simulated':a.simulated}
             with connection() as c:c.execute('INSERT INTO cycles VALUES(?,?,?,?)',(cycle['id'],run_id,n,json.dumps(cycle)))
             event(run_id,f'Cycle {n}: {cycle_out}', 'error' if cycle_out in ('fail','error') else 'info')
             patch_run(run_id, {'completed_cycles':n})
@@ -309,7 +322,7 @@ def run_worker(run_id):
                 time.sleep(.05)
     except Exception as exc:
         event(run_id, 'Execution error: '+str(exc),'error')
-        patch_run(run_id, {'message':redact(str(exc)),'outcome':'error'})
+        patch_run(run_id, {'message':redact(str(exc)),'outcome':'error','failure':diagnostic(stage,type(exc).__name__,str(exc)),'startup_evidence':redact({'command_log':getattr(getattr(a,'ssh',a),'command_log',[]),'serial_log':(''.join(serial_text)+(a.take_serial_log() if hasattr(a,'take_serial_log') else ''))[:262144]})})
     finally:
         drain_transport_events(a,run_id)
         capture_stop.set()
@@ -379,7 +392,7 @@ def state():
     for r in runs:
         if r.get('script_snapshot'):
             r['script_snapshot']={k:v for k,v in r['script_snapshot'].items() if k!='source'}
-    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.3.1','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
+    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards') if not b.get('deleted_at')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.3.1','storage':'SQLite · local','database_path':str(DB.resolve()),'credential_storage':'Passwords: server memory only; cleared on restart. IP addresses, usernames and key paths: local SQLite database.','execution':'Local worker · simulator / SSH'}
 
 
 def save_board(body, bid=None):
@@ -428,7 +441,8 @@ def create_board(body:BoardInput):
 @app.post('/api/boards/{bid}/connection')
 def update_board_connection(bid:str,body:BoardInput):
     with BOARD_GATE:
-        item('boards',bid);require_idle(bid)
+        b=item('boards',bid);require_idle(bid)
+        if b.get('deleted_at'):raise HTTPException(404,'Board removed')
         return save_board(body,bid)
 
 
@@ -438,6 +452,16 @@ def forget_passwords(bid:str):
         item('boards',bid);require_idle(bid)
         set_credentials(bid,ssh_password='',uart_password='',sudo_password='')
         return {'credential_status':credential_status(bid)}
+
+
+@app.post('/api/boards/{bid}/delete')
+def delete_board(bid:str):
+    with BOARD_GATE:
+        b=item('boards',bid);require_idle(bid)
+        b['deleted_at']=now()
+        with connection() as c:c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
+        set_credentials(bid,ssh_password='',uart_password='',sudo_password='')
+        return {'removed':True,'history_preserved':True}
 
 
 class VerificationInput(BaseModel):
@@ -454,6 +478,7 @@ def serial_ports():
 def verify(bid:str,body:VerificationInput | None=None):
     with BOARD_GATE:
         require_idle(bid);b=item('boards',bid)
+        if b.get('deleted_at'):raise HTTPException(404,'Board removed')
         transport=body.transport if body and body.transport else b['mode']
         if b['mode']=='simulator' and transport!='simulator':raise HTTPException(422,'Simulator cannot verify physical connections')
         if b['mode']!='simulator' and transport=='simulator':raise HTTPException(422,'Physical boards cannot be verified through the simulator')
@@ -487,10 +512,27 @@ def create_script(body:ScriptInput):
     return {k:v for k,v in s.items() if k!='source'}
 
 
+@app.get('/api/scripts/{sid}')
+def get_script(sid:str):
+    return item('scripts',sid)
+
+
+@app.post('/api/scripts/{sid}/edit')
+def edit_script(sid:str,body:ScriptInput):
+    if not body.confirmed:raise HTTPException(422,'Review the edited script before saving')
+    with BOARD_GATE:
+        old=item('scripts',sid)
+        s=body.model_dump(exclude={'confirmed'})
+        s.update(id=sid,version=old.get('version',1)+1,sha256=hashlib.sha256(s['source'].encode()).hexdigest(),created_at=old['created_at'],updated_at=now())
+        with connection() as c:c.execute('UPDATE scripts SET data=? WHERE id=?',(json.dumps(s),sid))
+    return {k:v for k,v in s.items() if k!='source'}
+
+
 @app.post('/api/runs',status_code=201)
 def create_run(body:RunInput):
     with BOARD_GATE:
         board=item('boards',body.board_id)
+        if board.get('deleted_at'):raise HTTPException(404,'Board removed')
         transport=body.transport or board['mode']
         if (board['mode']=='simulator') != (transport=='simulator'):
             raise HTTPException(422,'Simulator and physical transports cannot be mixed')
@@ -521,6 +563,11 @@ def get_run(rid:str):
     with connection() as c:
         r['cycles']=[json.loads(x['data']) for x in c.execute('SELECT data FROM cycles WHERE run_id=? ORDER BY number',(rid,))]
         r['events']=[dict(json.loads(x['data']),seq=x['seq']) for x in c.execute('SELECT seq,data FROM events WHERE run_id=? ORDER BY seq DESC LIMIT 200',(rid,))][::-1]
+    if r.get('message') and not r.get('failure'):
+        r['failure']=diagnostic('Historical result: stage was not recorded','LegacyError',r['message'])
+    for cycle in r['cycles']:
+        if cycle['outcome'] in ('fail','error') and not cycle.get('failure'):
+            cycle['failure']=diagnostic('Historical result: stage was not recorded','LegacyError',cycle.get('kernel_log','').split('\n')[0] or 'Test checks failed',cycle.get('checks',[]))
     # Hide source code from polling and exported reports; hash identifies the script.
     if r.get('script_snapshot'):r['script_snapshot']={k:v for k,v in r['script_snapshot'].items() if k!='source'}
     return r
