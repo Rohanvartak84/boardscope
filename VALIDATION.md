@@ -41,3 +41,8 @@ Live-service DOM checks cover the three-step home, compact cards, SSH-only quick
 ### Result guidance and management
 
 Added mocked workflow coverage for baseline error location, custom-script stdout/stderr and exit codes, script-edit snapshot preservation, board removal/history/password clearing and active-run removal rejection. Live-service DOM checks cover script viewing/editing, failure guidance, storage disclosure and confirmed board removal. JavaScript syntax and Python workflow tests are required. Physical hardware and visual browser layout remain unverified.
+
+
+### Frontend redesign checks
+
+Frontend-only fixtures in `tests/ui-dashboard.cjs` verify six-item navigation, four data-derived summaries, recorded error/stage rendering, stable row/input identity and focus during refresh, SSH-first/UART-success checking, no-UART and host-trust failure paths, disabled Assistant generation/context, authorized auto-transport selection, mobile menu/drawer behavior and disconnected recovery. Run with the same jsdom NODE_PATH as `tests/dashboard.cjs`. The live-service DOM harness retains simulator reboot/failure/resume, script editing, saved board settings, removal and escaping coverage. Backend code is unchanged; the 49-test regression suite passes. Chromium download was unavailable in this environment, so visual browser layout validation and physical-board verification remain outstanding.

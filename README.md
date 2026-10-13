@@ -152,3 +152,12 @@ Tests → View / edit loads the saved source, name and timeout. Saving requires 
 Boards → Remove board requires confirmation and rejects removal during active runs. Removal hides the board and forgets its passwords, while retaining the archived board record and past results in SQLite. It is not an erasure of test history.
 
 Boards also displays the actual database path on the PC running the server. Default: `~/.local/share/boardscope/boardscope.sqlite3`, overridden by `BOARDSCOPE_DATA`. IP/hostname, username, key path, UART settings, scripts and results are stored there. SSH/UART/sudo password values live only in server memory and disappear on restart; the dashboard shows availability, never the stored value. Keys remain in their original files.
+
+
+### Engineer dashboard UI
+
+The light, responsive dashboard includes Overview, Boards, Tests, Results, Assistant and Settings. Overview derives summaries, active tests, failure evidence and recent results from the existing APIs. Boards Reachable means last successful physical-board checks, not continuous monitoring. Passed/Failed Today use finished physical runs in the browser's local calendar day. Simulations remain explicitly labelled. Running tests show the latest recorded event, elapsed wall time and the relevant reported deadline; inventory timeouts are marked unreported.
+
+Check tries saved SSH settings first and configured UART after a connection/readiness failure, using the existing verify endpoints. Host-key/trust failures require review and do not trigger fallback. If SSH is absent, only configured UART is checked. Readiness and test status are separate; green UART fallback does not imply SSH is healthy. Saved check times and SSH errors remain available in More → Saved connection details. New test forms prefer the existing auto transport when both profiles are configured, and still require the existing same-board/fallback authorization; operators can select SSH or UART directly. No backend policy or API contract changes are included.
+
+Assistant is collapsed by default and opens with selected board/run/script-version context. All generation actions are disabled; this UI does not set up a model, generate responses or execute drafts. Existing deterministic evidence comparison remains available when no backend model is configured. Search, filters, selected boards, detail expansion and DOM focus survive polling. Responsive card rows and a full-screen mobile Assistant drawer include focus controls and reduced-motion styling.
