@@ -43,3 +43,18 @@ def test_unknown_ssh_host_key_rejected_and_connection_closed(monkeypatch):
     board=SSHBoard({'host':'test','port':22,'username':'engineer'})
     with pytest.raises(paramiko.SSHException):board.client()
     assert c.closed
+
+
+def test_failed_ssh_command_evidence_redacts_credentials_and_omits_stdin(monkeypatch):
+    from boardscope.credentials import set_credentials
+    board=SSHBoard({'id':'trace-test'})
+    set_credentials('trace-test',ssh_password='trace-secret')
+    def fail():raise RuntimeError('connect failed trace-secret')
+    monkeypatch.setattr(board,'client',fail)
+    try:
+        with pytest.raises(RuntimeError):board.command('sh -s',stdin_text='proprietary script body')
+        record=board.command_log[-1]
+        assert record['command']=='sh -s' and record['exit_code'] is None
+        assert '[REDACTED]' in record['error']
+        assert 'trace-secret' not in str(record) and 'proprietary' not in str(record)
+    finally:set_credentials('trace-test',ssh_password='')
