@@ -32,3 +32,7 @@ The live-service DOM harness verifies sudo settings/editing, fallback selection 
 ## Settings clarity (0.3.1)
 
 43 backend checks pass locally, including three profile edit/credential cases that preserve the unchanged profile's configuration and verification result while invalidating the edited profile. UI DOM coverage checks saved SSH/UART summaries, separate tabs, correct prefilled values, unsaved-state check disabling, profile preservation and selected-test connection summaries. Browser visual layout and physical hardware remain unverified.
+
+## SSH-first dashboard redesign
+
+Live-service DOM checks cover the three-step home, compact cards, SSH-only quick setup/editing and blank secret fields, advanced profile access, preserved old workflows, collapsed run options, and test-dependent custom/reboot controls. JavaScript syntax passes. No backend execution changes are introduced. Browser visual rendering and physical board behavior remain unverified.

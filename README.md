@@ -133,3 +133,11 @@ Each physical board card displays separate SSH and UART profiles: saved hostname
 Use **Edit SSH** or **Edit UART** to open that profile's tab. Board/default settings and reboot privileges have their own tabs. Switching tabs does not save changes. **Save settings** submits the complete prefilled configuration, preserving the other profile and its session credentials. Checks use saved settings and are disabled after you edit fields; save and reopen before checking. Changing SSH connection fields or entering a new SSH password invalidates only SSH verification; the corresponding rule applies to UART. Unchanged profiles retain their last-check results.
 
 The Start test dialog shows a read-only **Saved settings this test will use** summary for the selected transport; fallback shows both profiles. These values are snapshotted by the backend when the run is created. Board configuration persists; passwords remain only in the current process and must be entered again after a server restart.
+
+## SSH-first dashboard redesign
+
+The dashboard begins with Connect your board → Run a test → Review the result. Add SSH board opens a short SSH form; password login is the default for new boards, with port, OS and key login under SSH options. Saving a new simple SSH board does not contact hardware. Check SSH on its card is the separate read-only verification action. New simple boards leave interface/sound expectations unset until configured under full board settings.
+
+Board cards show the primary connection, address, credential/last-check state and Check/Edit/Start actions. Full saved profiles, UART and reboot configuration remain under Saved settings & other connections. The alternative full setup is explicitly available from the simple form; switching to it preserves the simple-form inputs in the unsaved draft. Existing configurations and test execution behavior are retained.
+
+Run options are collapsed by default; custom script fields and execution/reboot authorisations appear only for the selected test. The technical activity log is secondary to cycle results. Expanded saved-profile sections survive dashboard polling. The navigation labels are Dashboard, Boards, Tests and Results. This is the local application dashboard, not a public hosted website.
