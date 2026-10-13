@@ -125,3 +125,11 @@ UART-only boards can be registered, verified and used for Linux inventory tests.
 5. The run history, detail view and JSON plan identify UART as the execution transport. Results remain subject to explicit expected inventory rules; interface presence does not prove network connectivity.
 
 The 0.3 update enables UART reboot/custom-script tests and authorised SSH → UART fallback; see Current test connections above. One session owns reads/writes during a UART run; the SSH run's separate serial capture thread is not started. This milestone does not provide a live serial stream or continuous raw serial transcript. Close other terminal applications before testing. Stop is observed between bounded inventory commands and releases the serial session. Keep Send Enter enabled only when you know the board is at a Linux login/shell.
+
+## Saved connection settings (0.3.1)
+
+Each physical board card displays separate SSH and UART profiles: saved hostname/port/user/authentication or serial port/baud/console login, session-password availability, and the last verification result. Password values are never shown. The default connection is explicitly labelled as the default for new tests; an active run's connection policy and UART fallback are shown separately.
+
+Use **Edit SSH** or **Edit UART** to open that profile's tab. Board/default settings and reboot privileges have their own tabs. Switching tabs does not save changes. **Save settings** submits the complete prefilled configuration, preserving the other profile and its session credentials. Checks use saved settings and are disabled after you edit fields; save and reopen before checking. Changing SSH connection fields or entering a new SSH password invalidates only SSH verification; the corresponding rule applies to UART. Unchanged profiles retain their last-check results.
+
+The Start test dialog shows a read-only **Saved settings this test will use** summary for the selected transport; fallback shows both profiles. These values are snapshotted by the backend when the run is created. Board configuration persists; passwords remain only in the current process and must be entered again after a server restart.
