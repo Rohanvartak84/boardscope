@@ -28,3 +28,7 @@ The live-service DOM harness verifies the UART board's Start test action, defaul
 39 backend checks pass locally. Coverage includes real pyserial pseudo-terminal console emulation for username/password login, root and password-sudo reboot, changed boot identity after re-login, credential echo redaction, rejected sudo, chunked scripts larger than a terminal line, shell-quoted arguments, combined console output, nonzero exit codes and uncertain timeout blocking. Fake adapters verify reboot recovery after SSH/IP loss without a second reset, custom execution stopping after an uncertain result, host-trust failure blocking fallback, action/pairing authorisation, and actual cycle transport metadata.
 
 The live-service DOM harness verifies sudo settings/editing, fallback selection and pairing confirmation, enabled UART test choices and existing workflows. No physical hardware was rebooted; no actual SSH server, real board sudo configuration, hardware UART reconnect behavior or browser layout has been validated here. Physical acceptance is required before unattended testing.
+
+## Settings clarity (0.3.1)
+
+43 backend checks pass locally, including three profile edit/credential cases that preserve the unchanged profile's configuration and verification result while invalidating the edited profile. UI DOM coverage checks saved SSH/UART summaries, separate tabs, correct prefilled values, unsaved-state check disabling, profile preservation and selected-test connection summaries. Browser visual layout and physical hardware remain unverified.

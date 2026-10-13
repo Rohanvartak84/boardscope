@@ -379,23 +379,36 @@ def state():
     for r in runs:
         if r.get('script_snapshot'):
             r['script_snapshot']={k:v for k,v in r['script_snapshot'].items() if k!='source'}
-    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.3.0','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
+    return {'boards':[dict(b,credential_status=credential_status(b['id'])) for b in all_items('boards')],'runs':runs,'scripts':[{k:v for k,v in s.items() if k!='source'} for s in all_items('scripts')], 'ai_enabled':bool(os.environ.get('BOARDSCOPE_MODEL')),'version':'0.3.1','storage':'SQLite · local','execution':'Local worker · simulator / SSH'}
 
 
 def save_board(body, bid=None):
     b=body.model_dump()
+    old=item('boards',bid) if bid else None
     if b['mode']=='ssh' and (not b['host'] or not b['username']):raise HTTPException(422,'SSH host and username required')
     if b['mode']=='uart' and not b['serial_port']:raise HTTPException(422,'UART mode requires a serial port')
     if body.uart_password and any(c in body.uart_password.get_secret_value() for c in ('\n','\r')):
         raise HTTPException(422,'UART passwords cannot contain newline characters')
     if b['key_path']:
         path=Path(b['key_path']).expanduser()
-        if not path.is_file():raise HTTPException(422,'SSH key path must refer to a file on this host')
+        changed=old is None or old.get('key_path')!=str(path)
+        if b['auth_method']=='key' and changed and not path.is_file():raise HTTPException(422,'SSH key path must refer to a file on this host')
         b['key_path']=str(path)
-    b.update(id=bid or str(uuid.uuid4()),created_at=now())
+    b.update(id=bid or str(uuid.uuid4()),created_at=now(),settings_updated_at=now())
     with connection() as c:
         if bid:
-            old=item('boards',bid);b['created_at']=old['created_at']
+            b['created_at']=old['created_at']
+            profiles={'ssh':('host','port','username','auth_method','key_path'),'uart':('serial_port','baud','uart_username','uart_wake')}
+            checks={}
+            for transport,check in old.get('connection_checks',{}).items():
+                fields=profiles.get(transport,('mode',))
+                password_changed=(transport=='ssh' and body.ssh_password is not None) or (transport=='uart' and body.uart_password is not None)
+                if not password_changed and all(old.get(k,b.get(k))==b.get(k) for k in fields):checks[transport]=check
+            if checks:b['connection_checks']=checks
+            successes=[c for c in checks.values() if c.get('status')=='verified' and c.get('snapshot')]
+            if successes:
+                latest=max(successes,key=lambda c:c['checked_at'])
+                b['capabilities']=latest['snapshot'];b['verified_at']=latest['checked_at']
             c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
         else:c.execute('INSERT INTO boards VALUES(?,?)',(b['id'],json.dumps(b)))
     set_credentials(b['id'],ssh_password=body.ssh_password.get_secret_value() if body.ssh_password is not None else None,uart_password=body.uart_password.get_secret_value() if body.uart_password is not None else None,sudo_password=body.sudo_password.get_secret_value() if body.sudo_password is not None else None)

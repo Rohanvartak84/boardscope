@@ -189,3 +189,35 @@ def test_uart_inventory_runner_uses_one_session_without_ssh_or_second_reader(cli
 def test_uart_transport_requires_a_port(client):
     b=client.post('/api/boards',json={'name':'SSH only','mode':'ssh','host':'192.0.2.1','username':'engineer'}).json()
     assert client.post('/api/runs',json={'board_id':b['id'],'transport':'uart','test':'inventory'}).status_code==422
+
+
+@pytest.mark.parametrize('changed,keep,drop',[('host','uart','ssh'),('serial_port','ssh','uart'),('ssh_password','uart','ssh')])
+def test_editing_one_profile_preserves_the_other_saved_check(client,monkeypatch,changed,keep,drop):
+    payload={'name':'Desk','mode':'ssh','host':'192.0.2.1','username':'engineer','serial_port':'/dev/ttyTEST','auth_method':'password','ssh_password':'fake-initial-secret'}
+    b=client.post('/api/boards',json=payload).json();bid=b['id']
+    class OK:
+        def inspect(self):return {'boot_id':'00000000-0000-0000-0000-000000000001','machine':'riscv64','os':'Yocto'}
+    monkeypatch.setattr(module,'adapter',lambda b:OK())
+    for transport in ('ssh','uart'):assert client.post('/api/boards/'+bid+'/verify',json={'transport':transport}).status_code==200
+    before=module.item('boards',bid)
+    payload.pop('ssh_password');payload[changed]={'host':'192.0.2.2','serial_port':'/dev/ttyOTHER','ssh_password':'fake-new-secret'}[changed]
+    response=client.post('/api/boards/'+bid+'/connection',json=payload)
+    assert response.status_code==200,response.text
+    after=response.json()
+    assert after['connection_checks'][keep]==before['connection_checks'][keep]
+    assert drop not in after['connection_checks']
+    assert after['created_at']==before['created_at'] and after['settings_updated_at']
+    assert after['host']==payload['host'] and after['serial_port']==payload['serial_port']
+    assert 'fake-new-secret' not in response.text and 'fake-initial-secret' not in response.text
+
+
+def test_uart_edit_does_not_revalidate_unchanged_ssh_key_path(client,tmp_path):
+    key=tmp_path/'test-key';key.write_text('synthetic placeholder, not a private key')
+    payload={'name':'Desk','mode':'uart','serial_port':'/dev/ttyTEST','host':'192.0.2.1','username':'engineer','key_path':str(key)}
+    b=client.post('/api/boards',json=payload).json()
+    key.unlink();payload['baud']=9600
+    response=client.post('/api/boards/'+b['id']+'/connection',json=payload)
+    assert response.status_code==200 and response.json()['baud']==9600
+    assert response.json()['key_path']==str(key)
+    payload['key_path']=str(tmp_path/'different-missing-key')
+    assert client.post('/api/boards/'+b['id']+'/connection',json=payload).status_code==422
