@@ -46,3 +46,10 @@ Added mocked workflow coverage for baseline error location, custom-script stdout
 ### Frontend redesign checks
 
 Frontend-only fixtures in `tests/ui-dashboard.cjs` verify six-item navigation, four data-derived summaries, recorded error/stage rendering, stable row/input identity and focus during refresh, SSH-first/UART-success checking, no-UART and host-trust failure paths, disabled Assistant generation/context, authorized auto-transport selection, mobile menu/drawer behavior and disconnected recovery. Run with the same jsdom NODE_PATH as `tests/dashboard.cjs`. The live-service DOM harness retains simulator reboot/failure/resume, script editing, saved board settings, removal and escaping coverage. Backend code is unchanged; the 49-test regression suite passes. Chromium download was unavailable in this environment, so visual browser layout validation and physical-board verification remain outstanding.
+
+
+### Reference layout verification
+
+The reference refinement was rendered and visually reviewed in Chromium at 1774px with the Assistant open, and with a full-screen mobile Assistant at 390px. `tests/ui-layout.cjs` exercises the actual bundled frontend with intercepted synthetic API fixtures, checks no page-level horizontal overflow at 1774, 1280, 820 and 390px, verifies the collapsed default/disabled Assistant actions, and captures review images. It issues no requests to hardware. Screenshots are marked UI fixture/synthetic data and are not evidence of a lab session. This supersedes the earlier lack of browser layout verification for the redesigned interface.
+
+The optional layout harness requires Playwright in a development verification directory (not a production dependency); set `NODE_PATH` to its node_modules. Set `BOARDSCOPE_BROWSER_EXECUTABLE` for a local Chromium executable and optionally `BOARDSCOPE_SCREENSHOT_DIR` for review output, then run `node tests/ui-layout.cjs` from the repository root. Interaction regression checks remain `tests/ui-dashboard.cjs` and the live-service `tests/dashboard.cjs` harness.
