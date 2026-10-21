@@ -2,7 +2,7 @@
 
 ## Current boundary
 
-Browser dashboard → loopback FastAPI API → transactional SQLite + local thread worker → simulator or Paramiko SSH adapter → Linux board. Optional pyserial reader captures boot logs from a USB UART attached to the lab PC. Optional local Ollama endpoint analyses captured evidence. The AI has no execution tools.
+Browser dashboard → loopback FastAPI API → transactional SQLite + local thread worker → shared BoardExecutor contract → simulator, Paramiko SSH, pyserial UART or authorized fallback coordinator. Optional passive serial capture belongs to the SSH executor and shares serial ownership with UART command sessions. Optional local Ollama endpoint analyses captured evidence. The AI has no execution tools.
 
 The API serves the bundled dashboard from the same origin. Clients poll state and selected run details every 1.5 seconds. There are no external UI dependencies, CDN requests or Docker privilege mappings. Python runs natively on the machine with network and serial access.
 
@@ -12,7 +12,14 @@ The API serves the bundled dashboard from the same origin. Clients poll state an
 | --- | --- |
 | `boardscope/__main__.py` | Loopback-only launch and port selection |
 | `boardscope/app.py` | API validation, lifecycle, persistence, reservations, runner, controls, evidence comparison and optional AI integration |
-| `boardscope/adapters.py` | Fixed Linux capability inspection, one-shot software reboot, evidence capture, reviewed script execution and simulator |
+| `boardscope/executor.py` | Abstract executor, capabilities, validated requests, normalized results, deadlines/cancellation and error classification |
+| `boardscope/factory.py` | Side-effect-free construction for SSH, UART, simulator and automatic fallback |
+| `boardscope/linux_shell.py` | Shared POSIX shell-based Linux inventory and evidence collection |
+| `boardscope/adapters.py` | SSH executor and simulator |
+| `boardscope/uart.py` | Single-owner serial shell, framing, memory-only script transfer and reboot observation |
+| `boardscope/fallback.py` | Pre-dispatch connection selection and observation after reboot; no uncertain-action replay |
+| `boardscope/serial_resource.py` | Canonical-path serial leases and optional passive evidence capture |
+| `boardscope/credentials.py` | Volatile process credential broker and run-scoped snapshots |
 | `boardscope/static/` | Dashboard, boards, tests, history, run controls and evidence UI |
 | `tests/test_workflows.py` | Workflow, reservation, recovery, local access, authorisation and model output checks |
 
@@ -21,7 +28,7 @@ The API serves the bundled dashboard from the same origin. Clients poll state an
 | Table | Columns / constraints | Purpose |
 | --- | --- | --- |
 | boards | id PK, data JSON text | Board configuration and latest capability snapshot |
-| scripts | id PK, data JSON text | Immutable script source, SHA-256, timeout and creation time |
+| scripts | id PK, data JSON text | Versioned script source, SHA-256, timeout and creation time; runs keep snapshots |
 | runs | id PK, board_id FK, state, data JSON text | Immutable board/plan/script snapshots plus execution summary |
 | cycles | id PK, run_id FK, number, data JSON text; unique(run_id, number) | Checks, timestamps, boot snapshot, bounded kernel/serial logs and simulation flag |
 | events | seq autoincrement PK, run_id FK, data JSON text | Recorded reset intent, controls, warnings and execution events |
@@ -90,3 +97,20 @@ UARTBoard now exposes open/close session methods. Verification still opens and c
 `uart.py` adds passive reboot observation, nonce-specific sudo prompts and credential re-login. Custom source is transferred in bounded quoted octal printf chunks into an exclusively created private temporary file. Arbitrary script timeouts mark execution uncertain, block subsequent serial commands and terminate the run without a retry. UART stdout/stderr are merged by the console. Backend run records include actual cycle transport, connection warnings and fallback attempted/used flags. The dashboard exposes SSH/UART/auto, action authorisations and memory-only sudo settings.
 
 Readiness probes use the configured deadline, but transport operations are bounded attempts rather than hard real-time guarantees. Reboot dispatch has its own bounded credential/response phase. Serial evidence is collected when UART owns the stream; there is no independent background UART reader in fallback mode. SSH-only runs retain optional serial capture; auto/UART runs never start a competing reader.
+
+
+## Unified executor milestone (current)
+
+The common contract is implemented by SSHBoard, UARTBoard, Simulator and FallbackBoard. UART no longer subclasses SSH; both reuse LinuxShell. The runner configures cancellation, opens one executor, inspects readiness, performs plans, consumes normalized execution/serial/command evidence and closes the executor in a finally boundary. It contains no serial-opening or transport-specific session branches. Existing command/script tuple primitives are retained inside implementations for compatibility; reviewed workloads use ExecutionRequest and ExecutionResult.
+
+The factory validates transport names and only constructs objects. Fallback selection remains separate. Host trust, cancellation and uncertain-action errors are not converted into fallback opportunities. Following a dispatched script with a missing result, the run stops irrespective of continue policy, and that executor refuses a further workload. Reboots distinguish preflight/not-dispatched failure, explicit rejection and uncertain delivery. Intent is recorded before reviewed workload/reboot dispatch. Recovery observes boot identity and never issues a second reset.
+
+Execution records distinguish completion, dispatch certainty, optional exit status, combined versus separate streams, partial output, error class/type, duration, evidence completeness and whether remote execution may continue. They are additive cycle evidence, not a database migration or changed pass/fail rule. A completed nonzero reviewed script still follows its exit-code assertion contract; no remote status is an execution uncertainty rather than a failed assertion.
+
+SSH uses finite connect/auth/banner/channel waits, an absolute workload/command deadline, cancellation checks, fair stdout/stderr consumption and bounded input/output. A deadline/cancellation watcher closes the client during blocking library acknowledgement waits. Output is consumed before retrieving status; missing exit status is not accepted as an ordinary failure code. Explicit cleanup closes channels/clients. These are cooperative thread-based protections, not hard process isolation: stalled OS DNS resolution or an uninterruptible native driver operation can still require process supervision, which remains a future milestone. Local cancellation/connection closure does not prove target process termination.
+
+UART preserves a persistent shell under a shared canonical-port lease and POSIX exclusive-open request. Command frames use unpredictable transaction IDs, line boundaries and validated POSIX exit status. Echo is outside the command response envelope; malformed/missing action completion blocks further action. Scripts are transferred in bounded octal chunks into a shell variable, with a sentinel preserving trailing newlines, then piped to a native child shell. No BoardScope helper, daemon or temporary script file is installed. Source is bounded to 64000 UTF-8 bytes and cannot contain NUL. Completed scripts unset the variable; unresolved sessions may retain volatile target shell data until inspected or closed. Arbitrary scripts can themselves modify the board, spawn children or affect shell history; no universal remote cleanup guarantee is claimed.
+
+Credential fields are excluded from persisted board/run configuration. A worker owns a volatile scoped snapshot through cleanup; changing the broker's session values does not silently change an in-flight run's credentials. Explicit API inputs ssh_private_key and ssh_key_passphrase support in-memory SSH private-key parsing without temporary files or implicit disk/agent lookup for that session key. Existing explicit file-path/agent authentication remains compatible and is not claimed to be an exclusively volatile external key store. The dashboard has no new private-key input in this milestone. Known-host public trust data can remain on disk. Authentication traffic is excluded from UART login evidence; other evidence is redacted against known scoped/session secrets. Python memory zeroization and protection against OS swap/core dumps are not guaranteed.
+
+Existing board reservations remain backed by SQLite's active-run uniqueness constraint. Shared serial leases also prevent SSH passive capture and UART commands from opening the same canonical port independently. Optional passive-capture failure produces evidence warnings, not a failed SSH test or a false fallback flag. OS exclusivity is platform/driver dependent and cannot guarantee cooperation from every external terminal. Pairing authorization and permanent board identity remain distinct: a boot UUID changes across reboot and is not a permanent asset identifier.

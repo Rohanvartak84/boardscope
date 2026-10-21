@@ -1,3 +1,4 @@
+from tests.executor_stub import StubExecutor
 import json
 import time
 import pytest
@@ -125,7 +126,7 @@ def test_local_ai_invalid_response_does_not_change_outcome(client,monkeypatch):
 
 def test_authorised_custom_script_executes_snapshot_and_hides_source(client,monkeypatch):
     calls=[]
-    class FakeSSH:
+    class FakeSSH(StubExecutor):
         simulated=False
         def inspect(self):return {'boot_id':'00000000-0000-0000-0000-000000000001'}
         def script(self,source,args,timeout):
@@ -139,7 +140,8 @@ def test_authorised_custom_script_executes_snapshot_and_hides_source(client,monk
     assert response.status_code==201
     r=wait(client,response.json()['id'],lambda r:r['state']=='completed')
     assert r['outcome']=='fail' and r['completed_cycles']==1
-    assert calls==[('test -e "$1"',['/dev/test device'],7)]
+    assert len(calls)==1 and calls[0][:2]==('test -e "$1"',['/dev/test device'])
+    assert 6 < calls[0][2] <= 7
     assert r['script_snapshot']['sha256']==script['sha256']
     assert all('source' not in str(x.get('script_snapshot',{})) for x in client.get('/api/state').json()['runs'])
 
@@ -166,7 +168,7 @@ def test_local_ai_uses_local_endpoint_and_saves_reviewable_result(client,monkeyp
 
 
 def test_script_edit_preserves_run_snapshot(client,monkeypatch):
-    class Fake:
+    class Fake(StubExecutor):
         simulated=False
         def inspect(self):return {'boot_id':'mock'}
         def script(self,*args):return 0,'ok',''
@@ -201,7 +203,7 @@ def test_remove_active_board_rejected(client):
 
 
 def test_baseline_failure_has_location_and_guidance(client,monkeypatch):
-    class Broken:
+    class Broken(StubExecutor):
         simulated=False
         command_log=[{'command':'sh -s','error':'SSH authentication failed'}]
         def inspect(self):raise RuntimeError('SSH authentication failed')
@@ -217,7 +219,7 @@ def test_baseline_failure_has_location_and_guidance(client,monkeypatch):
 
 
 def test_cycle_failure_has_guidance_and_separate_script_output(client,monkeypatch):
-    class FailedScript:
+    class FailedScript(StubExecutor):
         simulated=False
         def inspect(self):return {'boot_id':'mock'}
         def script(self,*args):return 7,'device absent','permission denied'
@@ -228,4 +230,16 @@ def test_cycle_failure_has_guidance_and_separate_script_output(client,monkeypatc
     r=client.post('/api/runs',json={'board_id':b['id'],'test':'custom','script_id':s['id'],'allow_script':True,'cycles':1,'failure_policy':'abort'}).json()
     done=wait(client,r['id'],lambda r:r['state']=='completed');c=done['cycles'][0]
     assert c['failure']['stage']=='Execute custom script'
+    assert c['execution']['completion']=='completed' and c['execution']['exit_code']==7
+    assert not c['execution']['remote_may_be_running']
     assert c['script_output']=={'exit_code':7,'stdout':'device absent','stderr':'permission denied','combined':False}
+
+
+def test_memory_key_inputs_never_enter_database_and_forget_clears_them(client):
+    secret='PRIVATE KEY FIXTURE NOT A REAL KEY'
+    b=client.post('/api/boards',json={'name':'memory key','mode':'ssh','host':'192.0.2.1','username':'engineer','ssh_private_key':secret,'ssh_key_passphrase':'fixture-passphrase'}).json()
+    assert secret not in str(b) and secret not in client.get('/api/state').text
+    assert secret not in module.DB.read_bytes().decode(errors='ignore')
+    assert b['credential_status']['ssh_private_key']
+    result=client.post('/api/boards/'+b['id']+'/forget-passwords',json={}).json()
+    assert not result['credential_status']['ssh_private_key'] and not result['credential_status']['ssh_key_passphrase']

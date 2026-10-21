@@ -1,3 +1,4 @@
+from tests.executor_stub import StubExecutor
 import os
 import re
 import select
@@ -23,9 +24,10 @@ def client(tmp_path,monkeypatch):
 
 
 @contextmanager
-def console(uid='1000',sudo_ok=True):
+def console(uid='1000',sudo_ok=True,echo=False):
     import pty
     master,slave=pty.openpty();path=os.ttyname(slave);stop=threading.Event();wire=[];errors=[]
+    shell=subprocess.Popen(['sh'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
     state={'boot':1,'stage':'username','resets':0,'passwords':0}
     def worker():
         try:
@@ -60,15 +62,22 @@ def console(uid='1000',sudo_ok=True):
                             prompt=re.search(r'BS_[a-f0-9]+_SUDO',line.decode()).group(0)
                             os.write(master,('\r\n'+prompt).encode());state['stage']='sudo'
                     else:
+                        if echo:os.write(master,line+b'\r\n')
                         command=line.decode().replace("'id -u'", "'printf "+uid+"'")
-                        result=subprocess.run(['sh','-c',command],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=4)
-                        out=result.stdout
+                        shell.stdin.write((command+'\n').encode());shell.stdin.flush()
+                        out=b'';deadline=time.monotonic()+4
+                        while time.monotonic()<deadline:
+                            if select.select([shell.stdout],[],[],.1)[0]:out+=os.read(shell.stdout.fileno(),8192)
+                            if re.search(rb'BS_[a-f0-9]+_END:[0-9]+\n',out):break
+                        else:raise TimeoutError('Emulated shell command did not complete')
                         out=re.sub(rb'(BOOT=)[0-9a-fA-F-]{36}',lambda m:m.group(1)+(f'00000000-0000-0000-0000-{state["boot"]:012d}').encode(),out)
                         os.write(master,out.replace(b'\n',b'\r\n')+b'engineer@desk:~$ ')
         except Exception as exc:errors.append(exc)
     thread=threading.Thread(target=worker,daemon=True);thread.start()
     try:yield path,state,wire,errors
-    finally:stop.set();thread.join(1);os.close(master);os.close(slave)
+    finally:
+        stop.set();thread.join(3);shell.terminate();shell.wait(timeout=3)
+        shell.stdin.close();shell.stdout.close();os.close(master);os.close(slave)
 
 
 def board(path):
@@ -171,7 +180,7 @@ def wait(client,rid):
 @pytest.mark.parametrize('mode',['uart','auto'])
 def test_custom_runs_on_uart_and_auto_with_uncertain_result_stopping_run(client,monkeypatch,mode):
     calls=[]
-    class Adapter:
+    class Adapter(StubExecutor):
         simulated=False;active='uart'
         def open(self):pass
         def inspect(self):return {'boot_id':'boot','interfaces':['end0'],'sound_cards':3}
@@ -220,9 +229,10 @@ def test_reboot_observation_falls_back_without_second_reset(monkeypatch):
 
 
 def test_uart_reboot_runner_records_each_changed_boot(client,monkeypatch):
-    class UART:
+    class UART(StubExecutor):
+        transport_name='uart'
         simulated=False
-        def __init__(self):self.boot=1;self.resets=0;self.closed=False
+        def __init__(self):super().__init__();self.boot=1;self.resets=0;self.closed=False
         def open(self):pass
         def inspect(self):return {'boot_id':str(self.boot),'interfaces':['end0'],'sound_cards':3}
         def ready(self):return self.inspect()
@@ -252,9 +262,9 @@ def test_uart_script_timeout_blocks_further_commands_without_replay():
 
 
 def test_successful_fallback_keeps_connection_failure_visible(client,monkeypatch):
-    class Adapter:
+    class Adapter(StubExecutor):
         simulated=False;active='uart'
-        def __init__(self):self.notes=[{'level':'warning','message':'SSH unreachable; switching to UART'}]
+        def __init__(self):super().__init__();self.notes=[{'kind':'connection_fallback','level':'warning','message':'SSH unreachable; switching to UART'}]
         def inspect(self):return {'boot_id':'boot','interfaces':['end0'],'sound_cards':3}
         def ready(self):return self.inspect()
         def evidence(self):return 'kernel evidence'
@@ -268,3 +278,20 @@ def test_successful_fallback_keeps_connection_failure_visible(client,monkeypatch
     assert r['outcome']=='pass' and r['fallback_attempted'] and r['fallback_used']
     assert r['cycles'][0]['connection_notes'][0]['message']=='SSH unreachable; switching to UART'
     assert any(e['level']=='warning' and 'SSH unreachable' in e['message'] for e in r['events'])
+
+
+@pytest.mark.skipif(os.name!='posix',reason='Serial emulation needs POSIX')
+def test_uart_common_execution_record_filters_echo_and_uses_no_target_files():
+    from boardscope.executor import ExecutionRequest
+    with console(echo=True) as (path,state,wire,errors):
+        set_credentials('console-test',uart_password='fake-login-secret')
+        a=UARTBoard(board(path))
+        source='printf "real-output\\n"; printf "error-output\\n" >&2; exit 9\n'
+        try:
+            result=a.execute(ExecutionRequest(source,timeout_s=4))
+            assert result.completion=='completed' and result.exit_code==9
+            assert result.combined and result.stderr is None
+            assert result.stdout.strip()=='real-output\nerror-output'
+            assert all(b'/tmp/boardscope-' not in line for line in wire)
+            assert not errors
+        finally:a.close();clear_credentials()
