@@ -19,11 +19,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from fastapi.exceptions import RequestValidationError
-from .credentials import set_credentials, credential_status, clear_credentials, redact
+from .credentials import set_credentials, credential_status, clear_credentials, redact, credential_scope
 
+from .executor import ExecutionRequest, classify_error
 from .diagnostics import diagnostic
 from .adapters import adapter
-from .transport import ActionUncertain, ActionRejected, HostTrustError
+from .transport import ActionUncertain, ActionRejected, ActionNotDispatched, HostTrustError
 
 ACTIVE = ('queued', 'running', 'pausing', 'paused', 'stopping')
 STOP = threading.Event()
@@ -114,6 +115,8 @@ class BoardInput(BaseModel):
     port: int = Field(default=22, ge=1, le=65535)
     username: str = Field(default='', max_length=64)
     auth_method: Literal['key','password'] = 'key'
+    ssh_private_key: SecretStr | None = Field(default=None, max_length=64000, exclude=True)
+    ssh_key_passphrase: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
     ssh_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
     uart_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
     sudo_password: SecretStr | None = Field(default=None, max_length=1024, exclude=True)
@@ -199,41 +202,27 @@ def check_snapshot(s, board, boot_before=None):
 
 
 def drain_transport_events(a,run_id):
-    notes=a.drain_events() if hasattr(a,'drain_events') else []
+    notes=a.drain_events()
     for note in notes:event(run_id,note['message'],note['level'])
-    if notes:
-        patch_run(run_id,{'fallback_attempted':True,'fallback_used':getattr(a,'active',None)=='uart'})
+    if any(n.get('kind')=='connection_fallback' for n in notes):
+        patch_run(run_id,{'fallback_attempted':True,'fallback_used':a.active_transport=='uart'})
     return notes
 
 
 def run_worker(run_id):
+    with credential_scope(item('runs',run_id)['board_id']):
+        _run_worker(run_id)
+
+
+def _run_worker(run_id):
     r = item('runs', run_id); board = r['board_snapshot']; plan = r['plan']; a = adapter(board)
     r=patch_run(run_id, {'state':'running','started_at':now()}, states=('queued',))
     event(run_id, ('SIMULATOR: ' if a.simulated else board['mode'].upper()+': ') + 'Started ' + plan['test'])
     stage='Connection setup'
-    serial_handle = None; capture_stop = threading.Event(); capture_thread = None; serial_text=[]
+    a.configure(lambda:STOP.is_set() or item('runs',run_id)['state']=='stopping')
     try:
         if not await_control(run_id):return
-        if board['mode'] in ('uart','auto'):
-            if hasattr(a,'cancelled'):a.cancelled=lambda:STOP.is_set() or item('runs',run_id)['state']=='stopping'
-            if board['mode']=='uart':a.open()
-            elif hasattr(a,'uart'):a.uart.cancelled=lambda:STOP.is_set() or item('runs',run_id)['state']=='stopping'
-        if board['mode']=='ssh' and board.get('serial_port'):
-            import serial
-            serial_handle=serial.Serial(board['serial_port'], board['baud'], timeout=.2)
-            def capture():
-                size=0
-                while not capture_stop.is_set():
-                    try:
-                        data=serial_handle.read(4096)
-                        if data:
-                            size += len(data)
-                            if size > 2*1024*1024:
-                                event(run_id, 'Serial capture limit reached (2 MiB); capture incomplete', 'warning'); break
-                            serial_text.append(data.decode(errors='replace'))
-                    except Exception as exc:
-                        event(run_id, 'Serial capture error: ' + str(exc), 'warning'); break
-            capture_thread=threading.Thread(target=capture,daemon=True);capture_thread.start()
+        a.open()
         if not await_control(run_id):
             return
         stage='Baseline Linux readiness'
@@ -242,10 +231,8 @@ def run_worker(run_id):
         for n in range(1, plan['cycles']+1):
             if not await_control(run_id):
                 break
-            started=now(); tick=time.monotonic(); checks=[]; snapshot={}; logs=''; cycle_out='pass'; offset=len(serial_text);fatal=False;failure=None;script_output=None
-            if hasattr(a,'command_log'):a.command_log=[]
-            elif hasattr(a,'ssh'):a.ssh.command_log=[]
-            if hasattr(a,'take_serial_log'):a.take_serial_log()
+            started=now(); tick=time.monotonic(); checks=[]; snapshot={}; logs=''; cycle_out='pass'; fatal=False;failure=None;script_output=None;execution=None
+            a.begin_cycle()
             try:
                 if plan['test']=='reboot':
                     stage='Read boot identity before reboot'
@@ -256,7 +243,7 @@ def run_worker(run_id):
                     try:
                         stage='Issue software reboot'
                         a.reset()
-                    except ActionRejected:raise
+                    except (ActionRejected,ActionNotDispatched):raise
                     except Exception as exc:
                         event(run_id, 'Reset delivery uncertain or rejected; verifying boot identity: '+str(exc),'warning')
                     stage='Wait for new boot and Linux readiness'
@@ -284,9 +271,12 @@ def run_worker(run_id):
                     if a.simulated:
                         raise RuntimeError('Custom scripts require a physical board; simulator does not execute user code')
                     stage='Execute custom script'
-                    code,out,err=a.script(script['source'],plan['args'],script['timeout_s'])
-                    script_output={'exit_code':code,'stdout':redact(out)[:262144],'stderr':redact(err)[:262144],'combined':(getattr(a,'active',None) or board['mode'])=='uart'}
-                    logs=('Console stdout/stderr combined:\n' if (getattr(a,'active',None) or board['mode'])=='uart' else 'stdout:\n')+out+'\nstderr:\n'+err
+                    event(run_id,f"Cycle {n}: reviewed script intent recorded; SHA {script['sha256']}; workload will be issued once")
+                    execution=a.execute(ExecutionRequest(script['source'],tuple(plan['args']),script['timeout_s']))
+                    code,out,err=execution.exit_code,execution.stdout,execution.stderr or ''
+                    script_output={'exit_code':code,'stdout':out,'stderr':err,'combined':execution.combined}
+                    logs=('Console stdout/stderr combined:\n' if execution.combined else 'stdout:\n')+out+'\nstderr:\n'+err
+                    execution.raise_for_error()
                     checks=[{'name':script['name'],'outcome':'pass' if code==0 else 'fail','expected':'exit code 0','actual':code}]
                 if any(c['outcome']=='fail' for c in checks):
                     cycle_out='fail';failure=diagnostic(stage,'CheckMismatch','One or more test checks failed',checks)
@@ -299,9 +289,8 @@ def run_worker(run_id):
                 cycle_out='error';failure=diagnostic(stage,type(exc).__name__,str(exc));logs=str(exc)+'\n'+a.evidence()
             a.observation_deadline=None
             connection_notes=pending_notes+drain_transport_events(a,run_id);pending_notes=[]
-            serial_log=''.join(serial_text[offset:])
-            if hasattr(a,'take_serial_log'):serial_log+=a.take_serial_log()
-            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'failure':failure,'script_output':script_output,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(serial_log)[:262144],'transport':getattr(a,'active',None) or board['mode'],'connection_notes':connection_notes,'command_log':getattr(getattr(a,'ssh',a),'command_log',[]),'simulated':a.simulated}
+            serial_log=a.take_serial_log()
+            cycle={'id':str(uuid.uuid4()),'run_id':run_id,'number':n,'started_at':started,'ended_at':now(),'duration_ms':round((time.monotonic()-tick)*1000),'outcome':cycle_out,'checks':checks,'failure':failure,'script_output':script_output,'execution':execution.public() if execution else None,'snapshot':snapshot,'kernel_log':redact(logs)[:262144],'serial_log':redact(serial_log)[:262144],'transport':a.active_transport,'connection_notes':connection_notes,'command_log':a.execution_log(),'simulated':a.simulated}
             with connection() as c:c.execute('INSERT INTO cycles VALUES(?,?,?,?)',(cycle['id'],run_id,n,json.dumps(cycle)))
             event(run_id,f'Cycle {n}: {cycle_out}', 'error' if cycle_out in ('fail','error') else 'info')
             patch_run(run_id, {'completed_cycles':n})
@@ -322,15 +311,11 @@ def run_worker(run_id):
                 time.sleep(.05)
     except Exception as exc:
         event(run_id, 'Execution error: '+str(exc),'error')
-        patch_run(run_id, {'message':redact(str(exc)),'outcome':'error','failure':diagnostic(stage,type(exc).__name__,str(exc)),'startup_evidence':redact({'command_log':getattr(getattr(a,'ssh',a),'command_log',[]),'serial_log':(''.join(serial_text)+(a.take_serial_log() if hasattr(a,'take_serial_log') else ''))[:262144]})})
+        patch_run(run_id, {'message':redact(str(exc)),'outcome':'error','failure':diagnostic(stage,type(exc).__name__,str(exc)),'startup_evidence':redact({'command_log':a.execution_log(),'serial_log':a.take_serial_log()[:262144]})})
     finally:
         drain_transport_events(a,run_id)
-        capture_stop.set()
-        if capture_thread:capture_thread.join(timeout=1)
-        if serial_handle:serial_handle.close()
-        if board['mode'] in ('uart','auto'):
-            try:a.close()
-            except Exception:event(run_id,'UART close failed; check the local serial device','warning')
+        try:a.close()
+        except Exception:event(run_id,'Connection cleanup failed; inspect the local communication resource','warning')
         with connection() as c:
             c.execute('BEGIN IMMEDIATE')
             r=json.loads(c.execute('SELECT data FROM runs WHERE id=?',(run_id,)).fetchone()['data'])
@@ -415,7 +400,7 @@ def save_board(body, bid=None):
             checks={}
             for transport,check in old.get('connection_checks',{}).items():
                 fields=profiles.get(transport,('mode',))
-                password_changed=(transport=='ssh' and body.ssh_password is not None) or (transport=='uart' and body.uart_password is not None)
+                password_changed=(transport=='ssh' and any(value is not None for value in (body.ssh_password,body.ssh_private_key,body.ssh_key_passphrase))) or (transport=='uart' and body.uart_password is not None)
                 if not password_changed and all(old.get(k,b.get(k))==b.get(k) for k in fields):checks[transport]=check
             if checks:b['connection_checks']=checks
             successes=[c for c in checks.values() if c.get('status')=='verified' and c.get('snapshot')]
@@ -424,7 +409,7 @@ def save_board(body, bid=None):
                 b['capabilities']=latest['snapshot'];b['verified_at']=latest['checked_at']
             c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
         else:c.execute('INSERT INTO boards VALUES(?,?)',(b['id'],json.dumps(b)))
-    set_credentials(b['id'],ssh_password=body.ssh_password.get_secret_value() if body.ssh_password is not None else None,uart_password=body.uart_password.get_secret_value() if body.uart_password is not None else None,sudo_password=body.sudo_password.get_secret_value() if body.sudo_password is not None else None)
+    set_credentials(b['id'],ssh_private_key=body.ssh_private_key.get_secret_value() if body.ssh_private_key is not None else None,ssh_key_passphrase=body.ssh_key_passphrase.get_secret_value() if body.ssh_key_passphrase is not None else None,ssh_password=body.ssh_password.get_secret_value() if body.ssh_password is not None else None,uart_password=body.uart_password.get_secret_value() if body.uart_password is not None else None,sudo_password=body.sudo_password.get_secret_value() if body.sudo_password is not None else None)
     return dict(b,credential_status=credential_status(b['id']))
 
 
@@ -450,7 +435,7 @@ def update_board_connection(bid:str,body:BoardInput):
 def forget_passwords(bid:str):
     with BOARD_GATE:
         item('boards',bid);require_idle(bid)
-        set_credentials(bid,ssh_password='',uart_password='',sudo_password='')
+        set_credentials(bid,ssh_password='',uart_password='',sudo_password='',ssh_private_key='',ssh_key_passphrase='')
         return {'credential_status':credential_status(bid)}
 
 
@@ -460,7 +445,7 @@ def delete_board(bid:str):
         b=item('boards',bid);require_idle(bid)
         b['deleted_at']=now()
         with connection() as c:c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
-        set_credentials(bid,ssh_password='',uart_password='',sudo_password='')
+        set_credentials(bid,ssh_password='',uart_password='',sudo_password='',ssh_private_key='',ssh_key_passphrase='')
         return {'removed':True,'history_preserved':True}
 
 
@@ -486,13 +471,16 @@ def verify(bid:str,body:VerificationInput | None=None):
         if transport=='uart' and not b.get('serial_port'):raise HTTPException(422,'Configure a serial port first')
         target=dict(b,mode=transport)
         checks=b.setdefault('connection_checks',{})
+        executor=adapter(target)
         try:
-            result=redact(adapter(target).inspect())
+            with credential_scope(bid):result=redact(executor.inspect())
         except Exception as exc:
             message=redact(str(exc))
-            checks[transport]={'status':'failed','checked_at':now(),'error':message}
+            checks[transport]={'status':'failed','checked_at':now(),'error':message,'error_class':classify_error(exc),'stage':'Readiness verification'}
             with connection() as c:c.execute('UPDATE boards SET data=? WHERE id=?',(json.dumps(b),bid))
             raise HTTPException(400,message)
+        finally:
+            executor.close()
         checks[transport]={'status':'verified','checked_at':now(),'snapshot':result}
         # boot ID confirms both connections reached the same running kernel;
         # differing IDs may mean different boards or a reboot between checks.

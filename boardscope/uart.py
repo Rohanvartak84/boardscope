@@ -6,12 +6,12 @@ import threading
 import time
 import uuid
 
-from .adapters import SSHBoard
+from .executor import BoardExecutor, ExecutorCapabilities
+from .linux_shell import LinuxShell
+from .serial_resource import acquire_port
 from .credentials import get_secret, sudo_secret, redact
-from .transport import ActionUncertain, ActionRejected
+from .transport import ActionUncertain, ActionRejected, ActionNotDispatched, AuthenticationError, ResourceBusy, ResourceError, ProtocolError
 
-_GUARD=threading.Lock()
-_PORT_LOCKS={}
 _BOOTLOADER=re.compile(r'(?im)(hit any key|press any key|U-Boot>|^\s*=>\s*$|^\s*GRUB[^\n]*>|^\s*Shell>\s*$)')
 _LOGIN=re.compile(r'(?im)(?:^|\n)[^\n]*login:\s*$')
 _PASSWORD=re.compile(r'(?im)(?:^|\n)password:\s*$')
@@ -19,7 +19,9 @@ _SHELL=re.compile(r'(?:^|\n)[^\r\n]{0,160}[#$]\s*$')
 _ANSI=re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 
 
-class UARTBoard(SSHBoard):
+class UARTBoard(LinuxShell, BoardExecutor):
+    transport_name='uart'
+    capabilities=ExecutorCapabilities(separate_stderr=False,serial_capture=True)
     simulated=False
 
     def __init__(self,board):
@@ -32,10 +34,7 @@ class UARTBoard(SSHBoard):
         self._decoder=codecs.getincrementaldecoder('utf-8')(errors='replace')
 
     def _budget(self,timeout):
-        if self.observation_deadline is not None:
-            timeout=min(timeout,self.observation_deadline-time.monotonic())
-        if timeout<=0:raise TimeoutError('Boot observation deadline reached')
-        return timeout
+        return self.remaining(timeout)
 
     def _record(self,text):
         room=262144-len(self._log)
@@ -44,22 +43,21 @@ class UARTBoard(SSHBoard):
     def _read(self,capture=False):
         if self.cancelled():raise InterruptedError('Operator stopped serial observation')
         text=self._decoder.decode(self._handle.read(4096))
-        if capture:self._record(text)
+        if capture:self._record(redact(text))
         return text
 
     def open(self,timeout=15):
         import serial
         if self._blocked:raise ActionUncertain('UART command state is uncertain. Inspect the board manually before creating a new run.')
         if self._handle is not None:return
+        super().open()
         port=self.board.get('serial_port')
         if not port:raise RuntimeError('Select a serial port first')
-        with _GUARD:lock=_PORT_LOCKS.setdefault(port,threading.Lock())
-        if not lock.acquire(blocking=False):raise RuntimeError('Serial port busy in BoardScope')
-        self._lock=lock
+        self._lock=acquire_port(port)
         try:
             try:self._handle=serial.Serial(port,self.board.get('baud',115200),timeout=.1,write_timeout=2,exclusive=True)
             except (OSError,serial.SerialException):
-                raise RuntimeError('Cannot open serial port. Check the device path, host permissions and other terminal applications.') from None
+                raise ResourceError('Cannot open serial port. Check the device path, host permissions and other terminal applications.') from None
             self._decoder=codecs.getincrementaldecoder('utf-8')(errors='replace')
             self._login(self._handle,self._budget(timeout),allow_boot=self._reboot_pending)
             self._boot_shell_ready=self._reboot_pending
@@ -71,22 +69,29 @@ class UARTBoard(SSHBoard):
         finally:
             self._handle=None
             if self._lock is not None:self._lock.release();self._lock=None
+            super().close()
 
-    def _execute(self,script,timeout=15,action=False):
+    def _execute(self,script,timeout=15,action=False,parent=False):
         if self._blocked:raise ActionUncertain('UART action result is uncertain; subsequent commands are blocked')
+        deadline=time.monotonic()+self._budget(timeout)
         temporary=self._handle is None
         if temporary:self.open(timeout)
+        self.remaining(deadline-time.monotonic())
         marker='BS_'+uuid.uuid4().hex
         encoded=script.replace('\\','\\\\').replace('\n','\\n').replace('\r','\\r')
-        line="printf '%s\\n' "+shlex.quote(marker+'_BEGIN')+"; printf '%b' "+shlex.quote(encoded)+" | sh; bs_rc=$?; printf '\\n%s:%s\\n' "+shlex.quote(marker+'_END')+' "$bs_rc"\n'
+        body=('{ '+script+'; }') if parent else ("printf '%b' "+shlex.quote(encoded)+' | sh')
+        line="printf '%s\\n' "+shlex.quote(marker+'_BEGIN')+'; '+body+'; bs_rc=$?; printf "\\n%s:%s\\n" '+shlex.quote(marker+'_END')+' "$bs_rc"\n'
         if len(line.encode())>3500:
             if temporary:self.close()
             raise RuntimeError('UART command line too long; use registered custom scripts for larger code')
         sent=False;text='';start=None
         try:
             if self.cancelled():raise InterruptedError('Stopped before serial command')
-            sent=True;self._handle.write(line.encode());self._handle.flush()
-            text='';deadline=time.monotonic()+self._budget(timeout)
+            sent=True
+            if action:self._dispatch='possibly_sent'
+            wire=line.encode()
+            if self._handle.write(wire)!=len(wire):raise ProtocolError('Incomplete serial write; command boundary is unconfirmed')
+            text=''
             start=re.compile(r'(?:^|\n)'+marker+r'_BEGIN\r?\n')
             end=re.compile(r'(?:^|\n)'+marker+r'_END:(\d+)\r?\n')
             while time.monotonic()<deadline:
@@ -95,12 +100,16 @@ class UARTBoard(SSHBoard):
                 first=start.search(text);last=end.search(text)
                 if first and last and last.start()>=first.end():
                     out=text[first.end():last.start()].replace('\r','')
-                    self._record(out+'\n')
-                    return int(last.group(1)),out,''
+                    self._last_output=(out,'')
+                    self._record(redact(out)+'\n')
+                    code=int(last.group(1))
+                    if not 0<=code<=255:raise ProtocolError('Invalid UART completion exit status')
+                    return code,out,''
             raise TimeoutError('UART command deadline reached')
         except Exception as exc:
             first=start.search(text) if start is not None else None
-            if first:self._record(text[first.end():])
+            if first:
+                partial=text[first.end():];self._last_output=(partial,'');self._record(redact(partial))
             self.close()
             if action and sent:
                 self._blocked=True
@@ -117,24 +126,27 @@ class UARTBoard(SSHBoard):
         while time.monotonic()<deadline:
             # _login is also tested with a minimal serial object.
             if prefetched:prefetched=False
-            elif handle is self._handle:text+=self._read(capture=True)
+            elif handle is self._handle:
+                chunk=self._read()
+                if allow_boot and not sent_user:self._record(redact(chunk))
+                text+=chunk
             else:text+=handle.read(4096).decode(errors='replace')
             text=_ANSI.sub('',text[-16384:])
             bootloader=bool(_BOOTLOADER.search(text))
             if bootloader and not allow_boot:
                 raise RuntimeError('Bootloader prompt detected. Wait for Linux; BoardScope did not send login credentials.')
-            if re.search(r'(?i)(login incorrect|authentication failure)',text):raise RuntimeError('UART login rejected. Check the Linux username/password.')
+            if re.search(r'(?i)(login incorrect|authentication failure)',text):raise AuthenticationError('UART login rejected. Check the Linux username/password.')
             if _SHELL.search(text) and not re.search(r'(?im)^\s*(=>|U-Boot>|Shell>)',text.splitlines()[-1] if text.splitlines() else ''):return
             if _LOGIN.search(text) and not sent_user:
                 username=self.board.get('uart_username','')
                 if not username:raise RuntimeError('Linux login prompt detected. Enter a UART username in the connection settings.')
-                handle.write((username+'\n').encode());handle.flush();text='';sent_user=True
+                handle.write((username+'\n').encode());text='';sent_user=True
             elif _PASSWORD.search(text) and sent_user and not sent_password:
                 password=get_secret(self.board.get('id'),'uart_password')
-                if not password:raise RuntimeError('UART password is missing for this session. Open Connect and enter it again.')
-                handle.write((password+'\n').encode());handle.flush();text='';sent_password=True
+                if not password:raise AuthenticationError('UART password is missing for this session. Open Connect and enter it again.')
+                handle.write((password+'\n').encode());text='';sent_password=True
             elif not allow_boot and not text.strip() and not woke and time.monotonic()-opened>1 and self.board.get('uart_wake',False):
-                handle.write(b'\n');handle.flush();woke=True
+                handle.write(b'\n');woke=True
         raise TimeoutError('No Linux shell detected on UART. Check baud rate, console configuration and login settings. If Linux is already idle, enable the explicit Send Enter option.')
 
     def inspect(self):
@@ -153,6 +165,12 @@ class UARTBoard(SSHBoard):
         return self.inspect()
 
     def reset(self):
+        try:return self._reset()
+        except (ActionUncertain,ActionRejected,ActionNotDispatched):raise
+        except Exception as exc:
+            raise ActionNotDispatched('Reboot was not dispatched: '+str(exc)) from None
+
+    def _reset(self):
         self.open()
         self._before_boot=self.inspect()['boot_id']
         code,out,err=self.command('id -u')
@@ -172,7 +190,7 @@ class UARTBoard(SSHBoard):
         if self.cancelled():raise InterruptedError('Stopped before reboot dispatch')
         self._reboot_pending=True;self._reboot_text='';self._boot_shell_ready=False
         try:
-            self._handle.write(line.encode());self._handle.flush()
+            self._handle.write(line.encode())
             deadline=time.monotonic()+self._budget(3);text='';sent_password=False;interrupted_sudo=False
             while time.monotonic()<deadline:
                 text+=self._read(capture=True);self._reboot_text=text[-16384:]
@@ -183,9 +201,9 @@ class UARTBoard(SSHBoard):
                         raise ActionRejected('UART reboot rejected. Check sudo credentials and permission.')
                     return
                 if password and not sent_password and re.search(r'(?:^|\n)'+prompt+r'\s*$',text):
-                    self._handle.write((password+'\n').encode());self._handle.flush();sent_password=True;text=''
+                    self._handle.write((password+'\n').encode());sent_password=True;text=''
                 if 'Sorry, try again' in text and not interrupted_sudo:
-                    self._handle.write(b'\x03');self._handle.flush();interrupted_sudo=True
+                    self._handle.write(b'\x03');interrupted_sudo=True
             if interrupted_sudo:
                 self._blocked=True
                 raise ActionUncertain('Sudo rejected the password and console cleanup is unconfirmed; inspect the console manually')
@@ -198,28 +216,30 @@ class UARTBoard(SSHBoard):
             raise ActionUncertain('UART reboot delivery is uncertain: '+str(exc)+'. Observing only; reset will not be replayed.') from None
 
     def script(self,source,args,timeout):
+        if '\x00' in source or any('\x00' in arg for arg in args):raise ValueError('Shell input cannot contain NUL bytes')
+        if len(source.encode())>64000:raise ValueError('Script exceeds 64000 UTF-8 bytes')
         self.open()
         deadline=time.monotonic()+timeout
-        path='/tmp/boardscope-'+uuid.uuid4().hex+'.sh'
+        variable='bs_payload_'+uuid.uuid4().hex
         def execute(code,action=False):
-            remaining=deadline-time.monotonic()
+            remaining=min(deadline-time.monotonic(),self._budget(timeout))
             if remaining<=0:raise TimeoutError('UART script transfer/execution deadline reached')
-            rc,out,err=self._execute(code,remaining,action=action)
+            rc,out,err=self._execute(code,remaining,action=action,parent=True)
             if rc and not action:raise RuntimeError('UART script transfer failed: '+out[:500])
             return rc,out,err
-        execute('umask 077; (set -C; : > '+shlex.quote(path)+')')
+        execute(variable+"=''")
         try:
             data=source.encode('utf-8')
             for offset in range(0,len(data),256):
                 encoded=''.join('\\0%03o'%b for b in data[offset:offset+256])
-                execute("printf '%b' "+shlex.quote(encoded)+' >> '+shlex.quote(path))
-            run='sh '+shlex.quote(path)+' '+' '.join(shlex.quote(a) for a in args)
-            return execute(run+'; bs_script_rc=$?; rm -f '+shlex.quote(path)+'; exit "$bs_script_rc"',action=True)
+                # Preserve trailing newlines across command substitution with a sentinel.
+                execute(f'{variable}="${variable}"$(printf \'%bX\' {shlex.quote(encoded)}); {variable}=${{{variable}%X}}')
+            run=f'printf \'%s\' "${variable}" | sh -s -- '+' '.join(shlex.quote(a) for a in args)
+            return execute(run+'; bs_script_rc=$?; unset '+variable+'; (exit "$bs_script_rc")',action=True)
         except ActionUncertain:raise
         except Exception:
-            # Only clean up when no arbitrary script was dispatched.
             if not self._blocked:
-                try:self._execute('rm -f '+shlex.quote(path),2)
+                try:self._execute('unset '+variable,2,parent=True)
                 except Exception:pass
             raise
 

@@ -1,3 +1,4 @@
+from tests.executor_stub import StubExecutor
 import json
 import os
 import select
@@ -31,7 +32,7 @@ def test_password_is_session_only_and_errors_are_redacted(client,monkeypatch):
     assert get_secret(bid,'ssh_password')==secret
     assert secret not in client.get('/api/state').text
     assert secret not in module.DB.read_bytes().decode(errors='ignore')
-    class Fails:
+    class Fails(StubExecutor):
         def inspect(self):raise RuntimeError('login failed '+secret)
     monkeypatch.setattr(module,'adapter',lambda board:Fails())
     response=client.post('/api/boards/'+bid+'/verify',json={})
@@ -73,7 +74,7 @@ def test_edit_connection_keeps_blank_session_password_and_verifies_both(client,m
     assert client.post('/api/boards/'+bid+'/connection',json=payload).status_code==200
     assert get_secret(bid,'ssh_password')=='session-secret'
     modes=[]
-    class OK:
+    class OK(StubExecutor):
         def inspect(self):return {'boot_id':'00000000-0000-0000-0000-000000000001','machine':'riscv64','os':'Yocto'}
     monkeypatch.setattr(module,'adapter',lambda b:(modes.append(b['mode']) or OK()))
     ssh=client.post('/api/boards/'+bid+'/verify',json={'transport':'ssh'})
@@ -160,7 +161,8 @@ def wait_run(client,rid):
 def test_uart_inventory_runner_uses_one_session_without_ssh_or_second_reader(client,monkeypatch,primary):
     import serial
     calls=[]
-    class FakeUART:
+    class FakeUART(StubExecutor):
+        transport_name='uart'
         simulated=False
         def open(self):calls.append('open')
         def close(self):calls.append('close')
@@ -195,7 +197,7 @@ def test_uart_transport_requires_a_port(client):
 def test_editing_one_profile_preserves_the_other_saved_check(client,monkeypatch,changed,keep,drop):
     payload={'name':'Desk','mode':'ssh','host':'192.0.2.1','username':'engineer','serial_port':'/dev/ttyTEST','auth_method':'password','ssh_password':'fake-initial-secret'}
     b=client.post('/api/boards',json=payload).json();bid=b['id']
-    class OK:
+    class OK(StubExecutor):
         def inspect(self):return {'boot_id':'00000000-0000-0000-0000-000000000001','machine':'riscv64','os':'Yocto'}
     monkeypatch.setattr(module,'adapter',lambda b:OK())
     for transport in ('ssh','uart'):assert client.post('/api/boards/'+bid+'/verify',json={'transport':transport}).status_code==200

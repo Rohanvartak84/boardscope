@@ -1,0 +1,1 @@
+"""BoardScope regression fixtures."""
